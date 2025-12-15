@@ -12,4 +12,4 @@ pytorch를 이용해서 동방 게임(홍마향)을 AI가 자동으로 플레이
 - 기본목숨값은 3으로 설정됨.
 - -아직 미완성.
 
-![Uploading 스크린샷 2025-12-15 194333.png…]()
+<img width="639" height="504" alt="스크린샷 2025-12-15 194333" src="https://github.com/user-attachments/assets/d9c8766c-71e9-4e81-9bed-83b632aa3a5e" />
