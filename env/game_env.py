@@ -201,7 +201,7 @@ class GameEnv:
                     edge_pen = -0.12 * (x * x)
 
                     if self.s.same_action_count >= 3:
-                        edge_pen += -0.05
+                        edge_pen += -1.0
                         print(f"[EDGE] 현재 벽에 박고 있습니다. edge_pen={edge_pen}")
 
             reward += edge_pen
@@ -214,14 +214,14 @@ class GameEnv:
                 edge_px = min(px_i - 0, pf_r - px_i, py_i - 0, H - py_i)
 
                 if edge_px <= 60:
-                    edge60_pen = 0.12
+                    edge60_pen = 0.50
                     reward -= edge60_pen
                     self.s.edge60_cnt += 1  # (추가) 카운트
                     print(f"[EDGE60] edge_px={edge_px}px <= 60 -> -{edge60_pen:.2f} (pos=({px_i},{py_i}), pf_r={pf_r}, H={H})")
 
                 # ===== cy < 270 패널티 + 카운트 + print =====
                 if py_i < 270:
-                    top_pen = 0.10
+                    top_pen = 0.50
                     reward -= top_pen
                     self.s.top270_cnt += 1  # (추가) 카운트
                     print(f"[TOP270] cy={py_i} < 270 -> -{top_pen:.2f} (pos=({px_i},{py_i}))")
