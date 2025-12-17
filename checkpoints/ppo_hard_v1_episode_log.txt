@@ -40,3 +40,23 @@ idx	reward	edge60	top270
 idx	reward	edge60	top270
 (1/2)	-126.240000	33	16
 (2/2)	-124.400000	25	6
+
+========
+[RUN] 2025-12-17 14:06:41  episodes=2
+idx	reward	edge60	top270
+
+========
+[RUN] 2025-12-17 14:07:03  episodes=2
+idx	reward	edge60	top270
+(1/2)	-126.610000	26	23
+(2/2)	-126.740000	35	14
+
+========
+[RUN] 2025-12-17 14:19:40  episodes=2
+idx	reward	edge60	top270
+
+========
+[RUN] 2025-12-17 14:22:36  episodes=2
+idx	reward	edge60	top270
+(1/2)	-146.630000	151	21
+(2/2)	-140.510000	57	87
