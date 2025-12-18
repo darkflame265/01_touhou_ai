@@ -3,3 +3,28 @@
 [RUN] 2025-12-18 18:57:39  episodes=1
 idx	reward	edge60	top270
 (1/1)	-81.560440	256	113
+
+========
+[RUN] 2025-12-18 19:06:11  episodes=1
+idx	reward	edge60	top270
+(1/1)	-107.498956	0	0
+
+========
+[RUN] 2025-12-18 19:07:11  episodes=1
+idx	reward	edge60	top270
+(1/1)	-84.409791	197	97
+
+========
+[RUN] 2025-12-18 19:11:04  episodes=1
+idx	reward	edge60	top270
+(1/1)	-79.263310	263	148
+
+========
+[RUN] 2025-12-18 19:15:04  episodes=1
+idx	reward	edge60	top270
+(1/1)	-104.650342	3	37
+
+========
+[RUN] 2025-12-18 19:21:32  episodes=1
+idx	reward	edge60	top270
+(1/1)	-75.681666	189	271

@@ -17,7 +17,6 @@ class ObsBuilder:
         h0, w0 = img0.shape[:2]
         self.H, self.W = h0, w0
 
-        # ✅ Detector(템플릿) + Tracker(OpenCV) 하이브리드
         self.tracker = DetTrackTracker(
             frame_w=w0,
             frame_h=h0,
@@ -34,30 +33,34 @@ class ObsBuilder:
             init_xy=(w0 // 2, int(h0 * 0.78)),
             respawn_xy=(int(w0 * 0.35), int(h0 * 0.85)),
 
-            # ---- tracking side ----
-            tracker_prefer="CSRT",      # 정확도 우선(느리면 "MOSSE"로)
+            tracker_prefer="CSRT",
             init_box=56,
 
-            # ✅ NEW POLICY: template detect is LIMITED EVENTS ONLY
             max_detect_events=3,
-            acquire_window_frames=240,
 
-            # (레거시 옵션 - DetTrackTracker가 무시/호환 처리)
-            track_fail_to_detect=9999,
-            redetect_every=0,
+            # ✅ SUPER RELAXED acquire
+            acquire_window_frames=520,
+            acquire_streak_needed=2,
+            acquire_pos_tol=60,
+            acquire_min_best=0.36,
+            acquire_min_margin=0.0,
+            acquire_min_votes=1,
+            acquire_allow_votes1_if_best_ge=0.40,
 
-            # ---- detector side (MultiTemplateTracker 파라미터) ----
+            acquire_roi_start_r=140,
+            acquire_roi_expand_per_frame=3.0,
+            acquire_roi_max_r=520,
+
+            # detector side (그대로 두되, 필요하면 더 완화 가능)
             ema_alpha=0.35,
             base_search_radius=260,
             scales=(0.97, 1.0, 1.03),
-            min_score=0.40,
-            min_margin=0.08,
-            red_min_ratio=0.06,
-            white_min_ratio=0.09,
+            min_score=0.36,
+            min_margin=0.01,
 
             vote_radius=18,
             vote_min=2,
-            vote_min_score=0.30,
+            vote_min_score=0.25,
 
             ignore_template_paths=[
                 "assets/item_black_1.png",
@@ -66,24 +69,17 @@ class ObsBuilder:
                 "assets/item_black_4.png",
                 "assets/item_black_5.png",
             ],
-            ignore_min_score=0.65,
-            ignore_block_radius=32,
+            ignore_min_score=0.60,
+            ignore_block_radius=36,
             enable_ignore_block=True,
         )
 
-        self.player_center = None  # (x,y)
+        self.player_center = None
 
-        # =========================
-        # ✅ UI 영역 제외 설정
-        # =========================
         self.ui_cut_ratio = 0.66
         self.ui_cut_bottom_ratio = 1.00
 
     def _crop_square_bgr(self, img_bgr, cx, cy, size):
-        """
-        화면 밖은 REFLECT 패딩 (검은 패딩 힌트 방지)
-        항상 size x size 반환
-        """
         h, w = img_bgr.shape[:2]
         size = int(size)
         half = size // 2
@@ -110,26 +106,17 @@ class ObsBuilder:
             y2 += pad_t
 
         crop = img_bgr[y1:y2, x1:x2]
-
         if crop.shape[0] != size or crop.shape[1] != size:
             crop = cv2.resize(crop, (size, size), interpolation=cv2.INTER_LINEAR)
-
         return crop
 
     def _mask_out_ui_region(self, img_bgr: np.ndarray) -> np.ndarray:
-        """
-        트래커 입력에서 우측 UI 영역을 검정으로 마스킹.
-        (crop 관측은 원본에서 함)
-        """
         out = img_bgr.copy()
-
         x_ui = int(self.W * self.ui_cut_ratio)
         out[:, x_ui:, :] = 0
-
         if self.ui_cut_bottom_ratio < 1.0:
             y0 = int(self.H * self.ui_cut_bottom_ratio)
             out[y0:, x_ui:, :] = 0
-
         return out
 
     def make_state(self, img_bgr):
@@ -142,7 +129,6 @@ class ObsBuilder:
         if self.debug is not None:
             self.debug.show_tracker(img_for_track, self.tracker, tr, self.crop_size)
 
-        # tracker/detector 둘 다 실패해서 붕괴한 경우에만 fallback
         if self.use_fallback_full_preprocess:
             if (not tr.found) and (float(tr.conf) <= 0.01):
                 return self.screen.preprocess(img_bgr)
