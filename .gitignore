@@ -1,8 +1,6 @@
 # Python virtual environments
 .venv/
 venv/
-env/
-ENV/
 **/pyvenv.cfg
 
 # venv 내부(혹시 venv 폴더를 다른 이름으로 써도)

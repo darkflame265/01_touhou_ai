@@ -87,8 +87,9 @@ def main():
 
             next_state, reward, done = env.step(action_idx)
 
-            # 기존 PPOAgent 저장 방식 그대로
-            agent.store(state, action_idx, reward, done, log_prob, value)
+            exec_idx = getattr(env.s, "exec_action_idx", action_idx)  # ✅ 실제 실행된 action
+            agent.store(state, exec_idx, reward, done, log_prob, value)
+
 
             state = next_state
             total_reward += reward
