@@ -10,6 +10,7 @@ venv\Scripts\activate
 source venv/bin/activate
 
 pip install -r requirements.txt
+
 python main_ppo.py --episodes 1
 =======
 pytorch를 이용해서 동방 게임(홍마향)을 AI가 자동으로 플레이하는 프로그램을 만드는 중
