@@ -129,14 +129,26 @@ class ObsBuilder:
 
         # ===== (옵션) fallback: 완전 못 찾는 상황이면 전체 preprocess를 관측으로 =====
         if self.use_fallback_full_preprocess:
-            # detector가 워밍업이거나 conf가 극단적으로 낮으면 전체 관측(기존 로직과 유사)
             if (det is None) or (float(conf) <= 1e-6):
-                return self.screen.preprocess(img_bgr)
+                full = self.screen.preprocess(img_bgr)  # mode="low"면 기본 84x84
+
+                # ✅ 어떤 크기로 오든 obs_out_size로 강제 통일 (중요!)
+                if full.shape != (self.obs_out_size, self.obs_out_size):
+                    full = cv2.resize(
+                        full, (self.obs_out_size, self.obs_out_size),
+                        interpolation=cv2.INTER_AREA
+                    )
+
+                # preprocess는 이미 float32 0..1 이므로 그대로 반환
+                if full.dtype != np.float32:
+                    full = full.astype(np.float32)
+                return full
+
 
         # ===== 플레이어 중심 crop 관측 =====
         crop_bgr = self._crop_square_bgr(img_bgr, cx, cy, self.crop_size)
         crop_gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-        obs = cv2.resize(crop_gray, (self.obs_out_size, self.obs_out_size), interpolation=cv2.INTER_AREA)
+        obs = cv2.resize(crop_gray, (self.obs_out_size, self.obs_out_size), interpolation=cv2.INTER_LINEAR)
         obs = obs.astype(np.float32) / 255.0
 
         # (참고) 기존 debug.show_tracker는 tracker 객체가 필요해서 여기선 호출 안 함.

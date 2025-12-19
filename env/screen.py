@@ -84,11 +84,20 @@ class Screen:
 
 
     def capture(self):
-        win32gui.ShowWindow(self.hwnd, 9)  # SW_RESTORE
-        win32gui.SetForegroundWindow(self.hwnd)
+        # 창이 최소화되어 있으면 복구는 시도 (이건 비교적 안전)
+        try:
+            win32gui.ShowWindow(self.hwnd, 9)  # SW_RESTORE
+        except Exception:
+            pass
+
+        # ✅ 포커스 강제는 실패해도 그냥 무시 (Windows 정책상 자주 실패함)
+        try:
+            win32gui.SetForegroundWindow(self.hwnd)
+        except Exception:
+            # 포커스 못 가져와도 캡처는 가능해야 함
+            pass
 
         left, top, right, bottom = win32gui.GetWindowRect(self.hwnd)
-
         monitor = {
             "left": left,
             "top": top,
@@ -99,6 +108,7 @@ class Screen:
         img = np.array(self.sct.grab(monitor))
         img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
         return img
+
 
     def get_playfield_gray(self, img_bgr):
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)

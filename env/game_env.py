@@ -19,11 +19,13 @@ from env.action_masking import ActionMasker, MaskingConfig
 
 class GameEnv:
     """
-    ✅ 초간단 회피 학습 버전
+    ✅ 초간단 회피 학습 버전 + 반응속도/관측 개선
     - 보상: 생존 시 매 프레임 아주 소량(+alive_reward)
     - 감점: 피격 시 -50, 마지막(게임오버) -100
-    - danger / delta reward 완전 제거
-    - shaping(절대거리, edge, stuck 등) 전부 제거
+    - danger / delta reward 제거
+    - shaping 제거
+    - ✅ action_repeat 줄이고 frame_sleep 줄여서 반응속도 올림
+    - ✅ obs 해상도/크롭 키워서 총알이 보이게 함
     """
 
     def __init__(self, screen_mode="low"):
@@ -34,19 +36,29 @@ class GameEnv:
         self.ui = UIGuard(self.screen, self.s)
         self.reward_engine = RewardEngine(self.s)
 
+        # =========================
+        # ✅ 반응속도 튜닝 (중요)
+        # =========================
+        # EnvState 기본값을 여기서 강제로 덮어씀
+        self.s.action_repeat = 1          # ✅ 1이 가장 빠름 (추천 시작값)
+        self.s.frame_sleep = 0.012        # ✅ 0.010~0.016 권장(너무 낮으면 불안정 가능)
+
+        # =========================
+        # ✅ 관측 튜닝 (총알이 보이게)
+        # =========================
         self.debug = DebugViz()
         self.obs = ObsBuilder(
             self.screen,
             debug_viz=self.debug,
-            obs_out_size=84,
-            crop_size=160,
+            obs_out_size=84,          # ✅ 다시 84로 (shape 고정)
+            crop_size=256,            # ✅ 총알 보이게 크롭만 키움
             use_fallback_full_preprocess=True
         )
 
         # =========================
         # ✅ 최소 reward 구성
         # =========================
-        self.alive_reward = 0.005   # ✅ 극소량 (0.002~0.01 사이 권장)
+        self.alive_reward = 0.005   # 0.002~0.01 사이에서 조절
         self.hit_pen = -50.0
         self.gameover_pen = -100.0
         self.lobby_pen = -100.0
@@ -82,7 +94,6 @@ class GameEnv:
             pass
 
     def _end_episode(self, pen: float):
-        """공통 종료 처리(누적 반영 + 스택 + done 리턴 준비)"""
         self.guard.set_terminated()
         self._ep_add(pen)
         self.s.frame_stack.append(self.s.prev_state)
@@ -122,7 +133,7 @@ class GameEnv:
         self.s.exec_action_idx = 0
         self.s.exec_was_masked = False
 
-        # ✅ 에피소드 누적 점수 리셋
+        # 에피소드 누적 점수 리셋
         self.s.ep_total_reward = 0.0
 
         if hasattr(self.obs, "reset"):
@@ -133,17 +144,15 @@ class GameEnv:
         return np.stack(self.s.frame_stack, axis=0)
 
     def step(self, action_idx):
-        # 종료 후 입력 차단
         if self.s.episode_terminated:
             self.guard.terminated_step_return()
             set_attack_hold(False)
             for _ in range(6):
                 release_all()
                 time.sleep(0.02)
-            stacked_state = np.stack(self.s.frame_stack, axis=0)
-            return stacked_state, 0.0, True
+            return np.stack(self.s.frame_stack, axis=0), 0.0, True
 
-        # 로비/타이틀 검사 (즉시 종료)
+        # 로비/타이틀 검사
         pre_img = self.screen.capture()
         ui_ok = self.ui.ui_panel_present(pre_img)
         self.ui.update_ui_absent(ui_ok)
@@ -160,9 +169,7 @@ class GameEnv:
         press_keys(action.value)
 
         total_reward = 0.0
-        is_slow = action.name.startswith("SLOW")
 
-        # action_repeat 루프
         for _ in range(self.s.action_repeat):
             time.sleep(self.s.frame_sleep)
 
@@ -170,7 +177,6 @@ class GameEnv:
             ui_ok = self.ui.ui_panel_present(img)
             self.ui.update_ui_absent(ui_ok)
             if self.s.ui_absent_count >= self.s.ui_absent_needed:
-                # 로비 감지 종료
                 self.guard.set_terminated()
                 for _ in range(5):
                     release_all()
@@ -194,9 +200,6 @@ class GameEnv:
                 release_all()
                 press_keys(action.value)
 
-            # -------------------------
-            # ✅ reward: 생존 소량 + 피격 패널티만
-            # -------------------------
             reward = float(self.alive_reward)
             now = time.time()
 
@@ -221,7 +224,6 @@ class GameEnv:
                     self.s.last_hit_time = now
 
                     if self.s.lives <= 0:
-                        # ✅ 마지막은 -100만
                         for _ in range(3):
                             release_all()
                             time.sleep(0.02)
@@ -232,7 +234,7 @@ class GameEnv:
                         self.s.frame_stack.append(self.s.prev_state)
                         return np.stack(self.s.frame_stack, axis=0), float(total_reward), True
 
-                    # 1~2번째는 -50
+                    # 1~2번째 -50
                     try:
                         trk = getattr(self.obs, "tracker", None)
                         if trk is not None and hasattr(trk, "on_player_death"):
@@ -244,7 +246,7 @@ class GameEnv:
 
             self.s.prev_ui_lives = ui_now
 
-            # 디버그 표시(프레임 reward + 에피소드 누적)
+            # 디버그 표시
             if self.show_reimu_debug:
                 dbg = getattr(self.obs, "_dbg_last", None)
                 if dbg is not None:
@@ -259,14 +261,9 @@ class GameEnv:
                         total_reward=self.s.ep_total_reward,
                     )
 
-            # 누적
             self.s.prev_state = state
             total_reward += reward
             self._ep_add(reward)
-
-        # ✅ 후처리는 지금은 끄는 걸 추천 (원하면 다시 켜도 됨)
-        # avg_danger = 0.0
-        # total_reward = self.reward_engine.postprocess(total_reward, avg_danger, is_slow)
 
         self.s.step_i += 1
         self.s.frame_stack.append(self.s.prev_state)
