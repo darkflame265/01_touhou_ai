@@ -49,16 +49,7 @@ class GameEnv:
         # ===== ✅ Action Masking 파라미터 =====
         # "벽에서 이 거리 이내면 그 벽 방향 입력을 금지" (너가 원한 200px)
         self.mask_margin_px = 200
-
-        # ===== ✅ Top-limit(위쪽 제한) 파라미터 =====
-        # 플레이필드 상단으로부터 이 y(px)보다 위로 올라가면 UP 입력을 금지하는 "하드 리밋"
-        self.top_limit_px = 290         # 시작값: 240~320 사이에서 튜닝 추천
-
-        # 하드리밋보다 조금 아래부터는 "소프트 패널티"로 위쪽 성향을 누름
-        self.top_soft_band_px = 200      # 하드리밋 아래로 120px 구간
-        self.top_soft_pen = 0.05         # 프레임당 패널티 (0.03~0.12 사이 튜닝)
-
-
+        
         # 마스킹이 걸렸을 때, NONE으로 떨구지 말고
         # 가능하면 "안쪽"으로 자동 치환(반대 방향) 시도
         self.mask_use_flip = True
@@ -210,13 +201,7 @@ class GameEnv:
         near_right = (right_d <= margin_px)
         near_top = (top_d <= margin_px)
         near_bot = (bot_d <= margin_px)
-        # ===== ✅ Top-limit based masking (상단 올라가기 금지) =====
-        # 플레이필드 기준 y값 계산
-        # py가 (t + top_limit_px) 보다 더 위(작음)로 올라가면 "UP 방향"을 금지
-        top_forbid = (py <= (t + int(self.top_limit_px) - 10))
-
-
-
+       
         for i, a in enumerate(ACTIONS):
             dx, dy, _ = self._action_dir(a)
             if a.name == "NONE":
@@ -231,10 +216,6 @@ class GameEnv:
                 mask[i] = False
             if near_bot and dy > 0:
                 mask[i] = False
-            # ✅ 상단 제한: top_forbid 상태면 UP 입력을 금지
-            if top_forbid and dy < 0:
-                mask[i] = False
-
 
         return mask
 
@@ -268,12 +249,6 @@ class GameEnv:
             if (top_d <= margin_px and dy < 0) or (bot_d <= margin_px and dy > 0):
                 flip_y = True
 
-            # ===== ✅ 추가: top-limit 걸리면 UP은 무조건 DOWN으로 치환 시도 =====
-            # top_limit_px 기준보다 위로 올라가면(=py가 작아지면) UP 입력을 DOWN으로 flip
-            top_forbid = (py <= (t + int(self.top_limit_px)))
-            if top_forbid and dy < 0:
-                flip_y = True
-
         alt = orig
         if self.mask_use_flip:
             alt = self._flip_action(orig, flip_x=flip_x, flip_y=flip_y)
@@ -283,26 +258,11 @@ class GameEnv:
         except ValueError:
             alt_idx = 0  # NONE
 
-        # alt가 허용이면 alt로
-        if 0 <= alt_idx < len(ACTIONS) and bool(mask[alt_idx]):
-            return int(alt_idx), True, mask
+        # alt도 금지면: NONE
+        if not bool(mask[alt_idx]):
+            alt_idx = 0
 
-        # ===== ✅ 마지막 보정: top-limit 때문에 막혔다면, NONE으로 떨구지 말고 "DOWN" 쪽을 한 번 더 시도 =====
-        # (특히 UP-only가 NONE으로 떨어지는 빈도 방지)
-        if pc is not None:
-            dx, dy, is_slow = self._action_dir(orig)
-            if dy < 0:
-                # UP 계열이었다면 DOWN 계열을 강제로 찾아본다
-                forced = self._flip_action(orig, flip_y=True)
-                try:
-                    forced_idx = ACTIONS.index(forced)
-                    if bool(mask[forced_idx]):
-                        return int(forced_idx), True, mask
-                except ValueError:
-                    pass
-
-        # 그래도 안되면 NONE
-        return 0, True, mask
+        return int(alt_idx), True, mask
 
     # =========================================================
     # STEP
@@ -497,21 +457,6 @@ class GameEnv:
                     self.s.edge60_cnt += 1
                 if py < (t + 270):
                     self.s.top270_cnt += 1
-                    
-                # ===== ✅ 위쪽 성향 억제 (soft penalty) =====
-                # 하드리밋(t + top_limit_px)보다 아래쪽으로 top_soft_band_px 구간을 만들고,
-                # 그 구간에 들어오면 비율에 따라 패널티를 준다.
-                top_line = t + int(self.top_limit_px)
-                band = max(1, int(self.top_soft_band_px))
-                soft_start = top_line + band  # 이보다 아래는 패널티 0
-
-                if py < soft_start:
-                    # py가 top_line에 가까울수록(위로 갈수록) ratio가 1에 가까워짐
-                    ratio = float((soft_start - py) / band)  # 0..(>1)
-                    if ratio > 1.0:
-                        ratio = 1.0
-                    reward -= float(self.top_soft_pen * (ratio * ratio))
-
 
             # UI 기반 피격 감지 + 부활 워프
             if (ui_now is not None) and (now - self.s.last_hit_time) > self.s.hit_cooldown:
