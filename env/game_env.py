@@ -13,6 +13,8 @@ from env.reward_engine import RewardEngine
 from env.debug_viz import DebugViz
 from env.obs_builder import ObsBuilder
 
+from env.reimu_debug_viz import ReimuDebugViz
+
 
 class GameEnv:
     def __init__(self, screen_mode="low"):
@@ -56,6 +58,9 @@ class GameEnv:
         self.s.exec_action_idx = 0
         self.s.exec_was_masked = False
 
+        self.show_reimu_debug = True   # ← 토글 가능
+        self.reimu_debug = ReimuDebugViz()
+
     def reset(self):
         release_all()
         time.sleep(0.5)
@@ -97,6 +102,9 @@ class GameEnv:
         # 마스킹 실행 기록
         self.s.exec_action_idx = 0
         self.s.exec_was_masked = False
+
+        if hasattr(self, "obs") and hasattr(self.obs, "reset"):
+            self.obs.reset()
 
         release_all()
         set_attack_hold(True)
@@ -335,6 +343,22 @@ class GameEnv:
             # 관측/트래킹 업데이트 (player_center 최신화)
             state = self.obs.make_state(img)
 
+            if self.show_reimu_debug:
+                dbg = getattr(self.obs, "_dbg_last", None)
+                if dbg is not None:
+                    x_n, y_n, conf, logits = dbg
+
+                    # ✅ 여기서 step 루프의 현재 프레임은 img
+                    play = self.screen.get_playfield_gray(img)  # (H,W) gray playfield
+
+                    self.reimu_debug.show(
+                        play_gray=play,
+                        heatmap_logits=logits,
+                        xy_norm=(x_n, y_n),
+                        conf=conf,
+                    )
+
+
             # ===== ✅ 매 프레임 입력 재검사: 벽 쪽이면 즉시 다른 입력으로 갈아끼움 =====
             # (이게 없으면 action_repeat 동안 계속 벽으로 밀어붙이는 문제가 남아있음)
             cur_idx, cur_was_masked, _ = self._apply_action_mask(
@@ -451,9 +475,12 @@ class GameEnv:
                         return stacked_state, float(total_reward), True
 
                     try:
-                        self.obs.tracker.on_player_death()
+                        trk = getattr(self.obs, "tracker", None)
+                        if trk is not None and hasattr(trk, "on_player_death"):
+                            trk.on_player_death()
                     except Exception as e:
                         print(f"[WARN] tracker.on_player_death failed: {e}")
+
 
                     reward = -10.0
                     print(f"[DEBUG] HIT! (ui) internal lives={self.s.lives}")

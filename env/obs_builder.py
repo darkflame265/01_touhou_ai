@@ -1,7 +1,8 @@
 # env/obs_builder.py
 import cv2
 import numpy as np
-from env.det_track_tracker import DetTrackTracker
+
+from env.reimu_detector import ReimuDetector
 
 
 class ObsBuilder:
@@ -17,67 +18,33 @@ class ObsBuilder:
         h0, w0 = img0.shape[:2]
         self.H, self.W = h0, w0
 
-        self.tracker = DetTrackTracker(
-            frame_w=w0,
-            frame_h=h0,
-            template_paths=[
-                "assets/reimu_still.png",
-                "assets/reimu_left.png",
-                "assets/reimu_right.png",
-                "assets/reimu_still_tight.png",
-                "assets/reimu_left_tight.png",
-                "assets/reimu_right_tight.png",
-                "assets/reimu_black_still.png",
-                "assets/reimu_1.png",
-            ],
-            init_xy=(w0 // 2, int(h0 * 0.78)),
-            respawn_xy=(int(w0 * 0.35), int(h0 * 0.85)),
-
-            tracker_prefer="CSRT",
-            init_box=56,
-
-            max_detect_events=3,
-
-            # ✅ SUPER RELAXED acquire
-            acquire_window_frames=520,
-            acquire_streak_needed=2,
-            acquire_pos_tol=60,
-            acquire_min_best=0.36,
-            acquire_min_margin=0.0,
-            acquire_min_votes=1,
-            acquire_allow_votes1_if_best_ge=0.40,
-
-            acquire_roi_start_r=140,
-            acquire_roi_expand_per_frame=3.0,
-            acquire_roi_max_r=520,
-
-            # detector side (그대로 두되, 필요하면 더 완화 가능)
-            ema_alpha=0.35,
-            base_search_radius=260,
-            scales=(0.97, 1.0, 1.03),
-            min_score=0.36,
-            min_margin=0.01,
-
-            vote_radius=18,
-            vote_min=2,
-            vote_min_score=0.25,
-
-            ignore_template_paths=[
-                "assets/item_black_1.png",
-                "assets/item_black_2.png",
-                "assets/item_black_3.png",
-                "assets/item_black_4.png",
-                "assets/item_black_5.png",
-            ],
-            ignore_min_score=0.60,
-            ignore_block_radius=36,
-            enable_ignore_block=True,
-        )
-
-        self.player_center = None
-
+        # === UI 마스킹 파라미터(기존 유지) ===
         self.ui_cut_ratio = 0.66
         self.ui_cut_bottom_ratio = 1.00
+
+        # ✅ 레이무 검출기(히트맵)
+        self.det = ReimuDetector(
+            screen=self.screen,
+            weight_path="weights/reimu_heatmap_best.pt",
+            beta=12.0,
+            prior_strength=1.0,  # 너가 넣은 아래쪽 선호 프라이어 유지
+            ema_alpha=0.75,
+        )
+
+        # 마지막으로 믿을만한 플레이어 중심(풀프레임 좌표)
+        self.player_center = (w0 // 2, int(h0 * 0.78))
+        self._last_conf = 0.0
+
+        # conf가 너무 낮으면 위치 업데이트 안 함
+        self.conf_update_thr = 0.02  # soft-argmax peak prob는 작을 수 있음. 너무 빡세게 잡지 말기.
+
+        self._dbg_last = None
+
+    def reset(self):
+        if hasattr(self.det, "reset"):
+            self.det.reset()
+        self.player_center = (self.W // 2, int(self.H * 0.78))
+        self._last_conf = 0.0
 
     def _crop_square_bgr(self, img_bgr, cx, cy, size):
         h, w = img_bgr.shape[:2]
@@ -119,21 +86,60 @@ class ObsBuilder:
             out[y0:, x_ui:, :] = 0
         return out
 
+    def _playfield_norm_to_full_xy(self, x_n: float, y_n: float) -> tuple[int, int]:
+        """
+        detector는 screen.get_playfield_gray() 기준 0..1 좌표를 내놓는다.
+        screen.get_playfield_gray()는 기본적으로:
+          - full gray에서 좌측 playfield만 자름 (w * PLAYFIELD_RIGHT_RATIO)
+          - y는 전체 높이 그대로
+        따라서 full 좌표 변환은:
+          full_x = x_n * playfield_width
+          full_y = y_n * full_height
+        """
+        playfield_w = int(self.W * getattr(self.screen, "PLAYFIELD_RIGHT_RATIO", 0.70))
+        playfield_w = max(1, min(self.W, playfield_w))
+        cx = int(np.clip(x_n * playfield_w, 0, playfield_w - 1))
+        cy = int(np.clip(y_n * self.H, 0, self.H - 1))
+        return cx, cy
+
     def make_state(self, img_bgr):
-        img_for_track = self._mask_out_ui_region(img_bgr)
-        tr = self.tracker.update(img_for_track)
+        # (선택) 디버그용 UI 마스킹된 화면
+        img_for_dbg = self._mask_out_ui_region(img_bgr)
 
-        cx, cy = int(tr.x), int(tr.y)
-        self.player_center = (cx, cy)
+        det = self.det.step(img_bgr)
 
-        if self.debug is not None:
-            self.debug.show_tracker(img_for_track, self.tracker, tr, self.crop_size)
+        if det is None:
+            cx, cy = self.player_center
+            conf = 0.0
+            self._dbg_last = None
+        else:
+            x_n, y_n, conf, logits = det
+            cx_new, cy_new = self._playfield_norm_to_full_xy(x_n, y_n)
 
+            if conf >= self.conf_update_thr:
+                cx, cy = cx_new, cy_new
+                self.player_center = (cx, cy)
+                self._last_conf = conf
+            else:
+                cx, cy = self.player_center
+
+            # 🔥 디버그용 캐시
+            self._dbg_last = (x_n, y_n, conf, logits)
+
+
+        # ===== (옵션) fallback: 완전 못 찾는 상황이면 전체 preprocess를 관측으로 =====
         if self.use_fallback_full_preprocess:
-            if (not tr.found) and (float(tr.conf) <= 0.01):
+            # detector가 워밍업이거나 conf가 극단적으로 낮으면 전체 관측(기존 로직과 유사)
+            if (det is None) or (float(conf) <= 1e-6):
                 return self.screen.preprocess(img_bgr)
 
+        # ===== 플레이어 중심 crop 관측 =====
         crop_bgr = self._crop_square_bgr(img_bgr, cx, cy, self.crop_size)
         crop_gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
         obs = cv2.resize(crop_gray, (self.obs_out_size, self.obs_out_size), interpolation=cv2.INTER_AREA)
-        return obs.astype(np.float32) / 255.0
+        obs = obs.astype(np.float32) / 255.0
+
+        # (참고) 기존 debug.show_tracker는 tracker 객체가 필요해서 여기선 호출 안 함.
+        # 원하면 DebugViz에 "show_reimu(cx,cy,conf)" 같은 함수를 따로 만들어 연결하면 됨.
+
+        return obs

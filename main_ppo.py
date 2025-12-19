@@ -20,7 +20,8 @@ def parse_args():
 def main():
     args = parse_args()
 
-    CKPT_PATH = "checkpoints/ppo_hard_v1.pth"
+    #CKPT_PATH = "checkpoints/ppo_hard_v1.pth"
+    CKPT_PATH = "checkpoints/ppo_hard_reimuheat_crop_v1.pth"
     os.makedirs("checkpoints", exist_ok=True)
 
     # ==== 학습 로그 파일 저장 (ckpt 이름과 연동) ====
@@ -40,9 +41,8 @@ def main():
     if args.no_render:
         env.show_obs = False
 
-    # ===== Agent (네 PPOAgent 시그니처에 맞춤) =====
     agent = PPOAgent(
-        input_channels=4,
+        input_channels=4,   # 🔴 7 → 4 로 되돌리기
         num_actions=len(ACTIONS),
     )
 
