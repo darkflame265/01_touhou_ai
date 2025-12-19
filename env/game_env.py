@@ -50,7 +50,7 @@ class GameEnv:
         self.obs = ObsBuilder(
             self.screen,
             debug_viz=self.debug,
-            obs_out_size=84,          # ✅ 다시 84로 (shape 고정)
+            obs_out_size=128,          # ✅ 다시 84로 (shape 고정)
             crop_size=256,            # ✅ 총알 보이게 크롭만 키움
             use_fallback_full_preprocess=True
         )
