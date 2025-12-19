@@ -216,8 +216,8 @@ def recover_to_practice_from_lobby():
     focus_touhou_window()
     time.sleep(0.05)
 
-    for i in range(6):
-        tap_scancode(SC_X, label=f"X{i+1}/6", press=0.02, gap=0.02)
+    for i in range(10):
+        tap_scancode(SC_X, label=f"X{i+1}/12", press=0.02, gap=0.02)
         time.sleep(0.2)
 
     for i in range(5):
