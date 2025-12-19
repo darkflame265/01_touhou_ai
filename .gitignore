@@ -1,6 +1,9 @@
 # Python virtual environments
 .venv/
 venv/
+
+## png가 대량 저장된 폴더는 제외외
+vision/datasets/raw_playfield
 **/pyvenv.cfg
 
 # venv 내부(혹시 venv 폴더를 다른 이름으로 써도)
