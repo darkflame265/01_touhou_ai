@@ -75,3 +75,8 @@ idx	reward	edge60	top270
 [RUN] 2025-12-19 22:58:01  episodes=1
 idx	reward	edge60	top270
 (1/1)	-145.547843	19	350
+
+========
+[RUN] 2025-12-19 23:07:21  episodes=1
+idx	reward	edge60	top270
+(1/1)	-154.575691	11	262

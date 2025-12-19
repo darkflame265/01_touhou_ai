@@ -37,7 +37,7 @@ class GameEnv:
         )
 
         # =========================
-        # ✅ Shaping / penalty 설정
+        # Shaping / penalty 설정
         # =========================
         self.shaping_cfg = ShapingConfig(
             target_y_ratio=0.78,
@@ -49,8 +49,6 @@ class GameEnv:
             edge_guard_px=24,
             edge_guard_pen=0.08,
             abs_y_penalty_k=0.06,
-
-            # 필요하면 켜기(없으면 None으로 두면 꺼짐)
             top_limit_px=None,
             top_soft_band_px=160,
             top_soft_pen=0.08,
@@ -58,14 +56,11 @@ class GameEnv:
         self.pos_shaper = PositionShaper(self.screen, self.s, self.shaping_cfg)
 
         # =========================
-        # ✅ Action Masking 설정
+        # Action Masking 설정
         # =========================
         self.mask_cfg = MaskingConfig(
             margin_px=200,
             use_flip=True,
-
-            # 상단 마스킹을 쓰고 싶으면 여기만 켜면 됨
-            # (pos_shaper의 top_limit_px와 같이 쓰는 걸 추천)
             top_limit_px=None,
             top_limit_fudge_px=10,
         )
@@ -74,6 +69,9 @@ class GameEnv:
         # 실행 기록(학습/디버그용)
         self.s.exec_action_idx = 0
         self.s.exec_was_masked = False
+
+        # 에피소드 누적 점수(디버그 표시용)
+        self.s.ep_total_reward = 0.0
 
         self.show_reimu_debug = True
         self.reimu_debug = ReimuDebugViz()
@@ -114,12 +112,22 @@ class GameEnv:
         self.s.exec_action_idx = 0
         self.s.exec_was_masked = False
 
+        # ✅ 에피소드 누적 점수 리셋
+        self.s.ep_total_reward = 0.0
+
         if hasattr(self, "obs") and hasattr(self.obs, "reset"):
             self.obs.reset()
 
         release_all()
         set_attack_hold(True)
         return stacked
+
+    def _ep_add(self, x: float):
+        """에피소드 누적 점수(디버그용) 안전 누적."""
+        try:
+            self.s.ep_total_reward += float(x)
+        except Exception:
+            pass
 
     def step(self, action_idx):
         # 종료 후 입력 차단
@@ -143,7 +151,10 @@ class GameEnv:
             self.guard.set_terminated()
             self.s.frame_stack.append(self.s.prev_state)
             stacked_state = np.stack(self.s.frame_stack, axis=0)
-            return stacked_state, -100.0, True
+
+            pen = -100.0
+            self._ep_add(pen)  # ✅ 에피소드 누적에도 반영
+            return stacked_state, pen, True
 
         # step 시작 마스킹
         masked_idx, was_masked, _ = self.masker.apply_action_mask(action_idx, pre_img)
@@ -181,17 +192,17 @@ class GameEnv:
                     release_all()
                     time.sleep(0.02)
 
-                total_reward += -100.0
+                pen = -100.0
+                total_reward += pen
+                self._ep_add(pen)  # ✅ 에피소드 누적에도 반영
                 force_debug = True
+
                 self.s.frame_stack.append(self.s.prev_state)
                 stacked_state = np.stack(self.s.frame_stack, axis=0)
                 return stacked_state, float(total_reward), True
 
             # 관측/트래킹 업데이트
             state = self.obs.make_state(img)
-
-            # ... (마스킹 재적용 / gameover 검사 / danger 계산 / motion penalty / shaping / hit penalty 등)
-            # reward가 최종 결정된 "후"에 show 호출
 
             # 매 프레임 마스킹 재적용
             cur_idx, cur_was_masked, _ = self.masker.apply_action_mask(masked_idx, img)
@@ -203,23 +214,9 @@ class GameEnv:
                 release_all()
                 press_keys(action.value)
 
+            # ===== 여기부터 reward 계산 =====
             reward = 0.1
             now = time.time()
-
-            if self.show_reimu_debug:
-                dbg = getattr(self.obs, "_dbg_last", None)
-                if dbg is not None:
-                    x_n, y_n, conf, logits = dbg
-                    play = self.screen.get_playfield_gray(img)
-
-                    self.reimu_debug.show(
-                        play_gray=play,
-                        heatmap_logits=logits,
-                        xy_norm=(x_n, y_n),
-                        conf=conf,
-                        reward=reward,                
-                        total_reward=total_reward,
-                    )
 
             # 게임오버 flash 감지
             hit_fx, gameover_fx = self.screen.detect_death(img)
@@ -230,8 +227,12 @@ class GameEnv:
                 for _ in range(3):
                     release_all()
                     time.sleep(0.02)
-                total_reward += -100.0
+
+                pen = -100.0
+                total_reward += pen
+                self._ep_add(pen)  # ✅ 에피소드 누적에도 반영
                 force_debug = True
+
                 self.s.frame_stack.append(self.s.prev_state)
                 stacked_state = np.stack(self.s.frame_stack, axis=0)
                 return stacked_state, float(total_reward), True
@@ -247,7 +248,7 @@ class GameEnv:
             if motion_energy < 0.002:
                 reward -= 0.03
 
-            # ✅ 위치 기반 shaping/패널티(한 줄로 정리됨)
+            # 위치 기반 shaping/패널티
             reward += self.pos_shaper.step_reward(img, self.obs.player_center)
 
             # UI 기반 피격 감지
@@ -262,8 +263,12 @@ class GameEnv:
                         for _ in range(3):
                             release_all()
                             time.sleep(0.02)
-                        total_reward += -100.0
+
+                        pen = -100.0
+                        total_reward += pen
+                        self._ep_add(pen)  # ✅ 에피소드 누적에도 반영
                         force_debug = True
+
                         self.s.frame_stack.append(self.s.prev_state)
                         stacked_state = np.stack(self.s.frame_stack, axis=0)
                         return stacked_state, float(total_reward), True
@@ -275,36 +280,49 @@ class GameEnv:
                     except Exception as e:
                         print(f"[WARN] tracker.on_player_death failed: {e}")
 
+                    # ✅ 피격 프레임 reward는 강제 -50
                     reward = -50.0
                     print(f"[DEBUG] HIT! (ui) internal lives={self.s.lives}")
                     force_debug = True
 
             self.s.prev_ui_lives = ui_now
 
+            # ✅ 디버그 표시: "프레임 reward 최종값" + "에피소드 누적(이번 프레임 더하기 전 값)"
+            if self.show_reimu_debug:
+                dbg = getattr(self.obs, "_dbg_last", None)
+                if dbg is not None:
+                    x_n, y_n, conf, logits = dbg
+                    play_dbg = self.screen.get_playfield_gray(img)
+                    self.reimu_debug.show(
+                        play_gray=play_dbg,
+                        heatmap_logits=logits,
+                        xy_norm=(x_n, y_n),
+                        conf=conf,
+                        reward=reward,
+                        total_reward=self.s.ep_total_reward,
+                    )
+
+            # 내부 lives가 0이면 종료 패널티(-50) 추가 후 break
             if self.s.lives <= 0:
                 print("[DEBUG] GAME OVER! internal lives=0")
                 self.guard.set_terminated()
-                total_reward += -50.0
+
+                pen = -50.0
+                total_reward += pen
+                self._ep_add(pen)  # ✅ 에피소드 누적에도 반영
                 force_debug = True
                 break
 
+            # 정상 프레임 누적
             self.s.prev_state = state
             total_reward += reward
+            self._ep_add(reward)  # ✅ 매 프레임 에피소드 누적
 
         avg_danger = danger_sum / max(1, self.s.action_repeat)
         total_reward = self.reward_engine.postprocess(total_reward, avg_danger, is_slow)
 
         self.s.step_i += 1
-        if force_debug or (self.s.step_i % self.s.debug_every == 0):
-            pc = self.obs.player_center
-            # if pc is not None:
-            #     print(
-            #         f"[DEBUG] action={action.name} ui_ok={ui_ok} danger={avg_danger:.4f} "
-            #         f"player=({pc[0]},{pc[1]}) edge60={getattr(self.s,'edge60_cnt',0)} "
-            #         f"stuck={getattr(self.s,'stuck_run',0)} masked={getattr(self.s,'exec_was_masked',False)}"
-            #     )
-            # else:
-            #     print(f"[DEBUG] action={action.name} ui_ok={ui_ok} danger={avg_danger:.4f}")
+        # (print 디버그는 네가 주석 처리해둔 상태 유지)
 
         self.s.frame_stack.append(self.s.prev_state)
         stacked_state = np.stack(self.s.frame_stack, axis=0)
