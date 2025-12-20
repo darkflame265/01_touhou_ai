@@ -1,3 +1,4 @@
+# main_ppo.py
 import argparse
 import os
 from datetime import datetime
@@ -62,6 +63,22 @@ def boot_print_state(env):
         print("[BOOT] [UNKNOWN] 감지 실패 (창 크기/밝기/텍스처에 따라 흔들릴 수 있음)")
 
 
+def _try_clear_agent_rollout(agent):
+    """
+    ABORTED 때, 아직 update() 되지 않은 rollout/버퍼가 남아있으면 버리는 게 안전함.
+    PPOAgent 구현이 다양해서 '있으면 호출' 방식으로만 처리.
+    """
+    for name in ("clear", "reset_buffer", "reset_storage", "clear_buffer", "clear_rollout"):
+        fn = getattr(agent, name, None)
+        if callable(fn):
+            try:
+                fn()
+                print(f"[PPO] agent.{name}() called (abort cleanup)")
+            except Exception:
+                pass
+            break
+
+
 def main():
     args = parse_args()
 
@@ -96,7 +113,7 @@ def main():
         print("[PPO] no checkpoint found, training from scratch")
 
     print("\n[INFO] ESC 중단: Windows 전역 감지(GetAsyncKeyState)")
-    print(" - 게임 창이 포커스여도 ESC를 잡고 즉시 종료/저장합니다.\n")
+    print(" - 게임 창이 포커스여도 ESC를 잡고 즉시 종료합니다.\n")
     time.sleep(0.7)
 
     stop_requested = False
@@ -110,12 +127,11 @@ def main():
 
             print(f"\n========== EPISODE {ep}/{args.episodes} ==========")
 
-            # ✅ 에피소드 시작 전에 현재 화면 위치 한번 찍어주면 편함
+            # ✅ 에피소드 시작 전에 현재 화면 위치 한번 찍기
             st = detect_location(env.screen)
             print(f"[BOOT->EP] state={st.get('state')} selected={st.get('selected_name')}")
 
             if ep == 1:
-                # 커서가 Practice에 맞춰져 있다는 가정
                 print("[MENU] [practice 모드 진입 중...]")
                 enter_practice_from_cursor()
                 print("[MENU] [practice 모드 진입 완료(시퀀스 수행)]")
@@ -137,7 +153,7 @@ def main():
                 if esc_pressed():
                     stop_requested = True
                     aborted = True
-                    print("[STOP] ESC pressed -> aborting NOW (release inputs, save, exit).")
+                    print("[STOP] ESC pressed -> aborting NOW (release inputs, NO SAVE/NO UPDATE for this episode).")
                     safe_release_inputs()
                     done = True
                     break
@@ -160,8 +176,6 @@ def main():
                 if agent.should_update():
                     agent.update(last_state=state, last_done=done)
 
-            agent.update(last_state=state, last_done=True)
-
             survival_sec = time.time() - ep_t0
             slow_ratio = slow_count / max(1, steps)
             top_actions = action_counter.most_common(5)
@@ -174,8 +188,18 @@ def main():
                 f"top_actions={top_actions_str} {note}"
             )
 
+            # ✅ 로그는 ABORTED여도 남긴다
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"({ep}/{args.episodes})\t{total_reward:.6f}\t{survival_sec:.3f}\t{note}\n")
+
+            if aborted:
+                # ✅ ABORTED 에피소드는 학습 반영/저장 금지
+                _try_clear_agent_rollout(agent)  # 있으면 버퍼 비우기
+                print("[STOP] Episode aborted -> skip final update & checkpoint save.")
+                break  # 보통은 바로 종료하는 게 안전(다음 ep 진행 X)
+
+            # ✅ 정상 종료 에피소드만 마지막 업데이트 + 저장
+            agent.update(last_state=state, last_done=True)
 
             agent.save(CKPT_PATH)
             print("[PPO] checkpoint saved")

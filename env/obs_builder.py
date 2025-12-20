@@ -101,6 +101,11 @@ class ObsBuilder:
         cx = int(np.clip(x_n * playfield_w, 0, playfield_w - 1))
         cy = int(np.clip(y_n * self.H, 0, self.H - 1))
         return cx, cy
+        
+    def on_player_death(self):
+        if hasattr(self.det, "on_player_death"):
+            self.det.on_player_death()
+
 
     def make_state(self, img_bgr):
         # (선택) 디버그용 UI 마스킹된 화면
