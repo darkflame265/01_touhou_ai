@@ -2,7 +2,8 @@ import time
 import numpy as np
 
 from env.screen import Screen
-from env.controller import press_keys, set_attack_hold, release_all
+from env.controller import press_keys, set_attack_hold, release_all, set_always_slow
+
 from env.actions import ACTIONS
 
 from env.env_state import EnvState
@@ -14,6 +15,7 @@ from env.obs_builder import ObsBuilder
 from env.reimu_debug_viz import ReimuDebugViz
 
 from env.action_masking import ActionMasker, MaskingConfig
+
 
 
 class GameEnv:
@@ -202,6 +204,8 @@ class GameEnv:
 
         release_all()
         set_attack_hold(True)
+        set_always_slow(True)   # ✅ 항상 SLOW
+
         return np.stack(self.s.frame_stack, axis=0)
 
     def step(self, action_idx):

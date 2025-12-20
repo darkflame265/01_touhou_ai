@@ -111,12 +111,32 @@ MOVE_KEYS = {
 _HELD = set()
 _ATTACK_HOLD = True
 
+# ✅ 항상 SLOW(Shift) 유지 모드
+_ALWAYS_SLOW = False
+
 
 def set_attack_hold(enabled: bool):
     global _ATTACK_HOLD
     _ATTACK_HOLD = bool(enabled)
     if not _ATTACK_HOLD:
         _key_up(ATTACK_KEY)
+
+
+def set_always_slow(enabled: bool):
+    """
+    ✅ enabled=True면 이동 시 Shift(SLOW)를 항상 누른 상태로 유지.
+    - 액션 공간은 그대로 두고, 실제 입력만 전부 SLOW로 바꿈.
+    - reset()에서 호출해 두면 키 꼬임에도 강함.
+    """
+    global _ALWAYS_SLOW
+    _ALWAYS_SLOW = bool(enabled)
+
+    # 즉시 반영: 켜면 눌러두고, 끄면 해제
+    slow_key = MOVE_KEYS["SLOW"]
+    if _ALWAYS_SLOW:
+        _key_down(slow_key)
+    else:
+        _key_up(slow_key)
 
 
 def _key_down(key: str):
@@ -134,14 +154,32 @@ def _key_up(key: str):
 
 
 def press_keys(action_keys):
+    """
+    action_keys: ["LEFT"], ["SLOW","UP"], ["UP","RIGHT"] 같은 형태
+    ✅ _ALWAYS_SLOW가 True면 action_keys에 SLOW가 없어도 Shift를 항상 누름.
+    """
     # 공격키 유지
     if _ATTACK_HOLD:
         _key_down(ATTACK_KEY)
     else:
         _key_up(ATTACK_KEY)
 
-    # 이동/모디파이어
+    # --- SLOW(shift)는 특별 처리 ---
+    slow_name = "SLOW"
+    slow_key = MOVE_KEYS[slow_name]
+    if _ALWAYS_SLOW:
+        _key_down(slow_key)
+    else:
+        if slow_name in action_keys:
+            _key_down(slow_key)
+        else:
+            _key_up(slow_key)
+
+    # --- 방향키 처리 ---
+    # SLOW는 이미 처리했으니 제외하고 나머지만
     for name, key in MOVE_KEYS.items():
+        if name == slow_name:
+            continue
         if name in action_keys:
             _key_down(key)
         else:
@@ -149,6 +187,12 @@ def press_keys(action_keys):
 
 
 def release_all():
-    for key in MOVE_KEYS.values():
+    """
+    모든 키 해제.
+    - 안전하게 항상 다 풀되, _ALWAYS_SLOW가 켜져 있으면 shift는 유지.
+    """
+    for name, key in MOVE_KEYS.items():
+        if name == "SLOW" and _ALWAYS_SLOW:
+            continue
         _key_up(key)
     _key_up(ATTACK_KEY)

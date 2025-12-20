@@ -510,7 +510,7 @@ def ensure_practice_cursor_from_lobby(screen, verify=True, max_try=3):
             return True
 
         st2 = detect_location(screen)
-        print(f"[MENU][BOOT] verify result: state={st2.get('state')} selected={st2.get('selected_name')} scores={st2.get('scores')}")
+        print(f"[MENU][BOOT] verify result: state={st2.get('state')} selected={st2.get('selected_name')}")
         if st2.get("state") == "LOBBY" and st2.get("selected_name") == "PRACTICE":
             return True
 

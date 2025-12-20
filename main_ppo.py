@@ -47,7 +47,7 @@ def safe_release_inputs():
 def boot_print_state(env):
     print("\n[BOOT] 현재 화면 위치 감지 중...")
     st = detect_location(env.screen)
-    print(f"[BOOT] state={st.get('state')} selected={st.get('selected_name')} scores={st.get('scores')}")
+    print(f"[BOOT] state={st.get('state')} selected={st.get('selected_name')}")
 
     if st.get("state") in ("ILLUST", "LOBBY"):
         ok = ensure_practice_cursor_from_lobby(env.screen, verify=True, max_try=3)
