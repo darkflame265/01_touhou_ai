@@ -5,27 +5,23 @@ import time
 from collections import Counter
 
 from env.game_env import GameEnv
-from env.controller import release_all, set_attack_hold  # ✅ 중단 시 입력 즉시 해제
+from env.controller import release_all, set_attack_hold
 from env.menu import (
     enter_practice_from_cursor,
     recover_to_practice_from_lobby,
     recover_from_score_to_lobby,
+    detect_location,
+    ensure_practice_cursor_from_lobby,
 )
 from env.actions import ACTIONS
 from agents.ppo_agent import PPOAgent
 
-# =========================
-# ✅ ESC stop helper (Windows global)
-# - 외부 모듈 없이, 게임 창 포커스여도 ESC를 감지
-# =========================
 import ctypes
-
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 VK_ESCAPE = 0x1B
 
 
 def esc_pressed() -> bool:
-    # GetAsyncKeyState: 최상위 비트(0x8000)가 눌림 상태
     return (user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0
 
 
@@ -37,7 +33,6 @@ def parse_args():
 
 
 def safe_release_inputs():
-    """학습 중단/종료 시 게임 입력을 안전하게 해제."""
     try:
         set_attack_hold(False)
     except Exception:
@@ -48,27 +43,46 @@ def safe_release_inputs():
         pass
 
 
+def boot_print_state(env):
+    print("\n[BOOT] 현재 화면 위치 감지 중...")
+    st = detect_location(env.screen)
+    print(f"[BOOT] state={st.get('state')} selected={st.get('selected_name')} scores={st.get('scores')}")
+
+    if st.get("state") in ("ILLUST", "LOBBY"):
+        ok = ensure_practice_cursor_from_lobby(env.screen, verify=True, max_try=3)
+        if ok:
+            print("[BOOT] [practice 커서 정렬 완료]")
+        else:
+            print("[BOOT] [practice 커서 정렬 실패] (감지가 흔들릴 수 있음. 그래도 시퀀스는 시도함)")
+    elif st.get("state") == "SCORE":
+        print("[BOOT] [SCORE] 감지됨 -> recover_from_score_to_lobby 후 다시 시도 추천")
+    elif st.get("state") == "IN_GAME":
+        print("[BOOT] [IN_GAME] 감지됨 (이미 플레이 중일 수 있음)")
+    else:
+        print("[BOOT] [UNKNOWN] 감지 실패 (창 크기/밝기/텍스처에 따라 흔들릴 수 있음)")
+
+
 def main():
     args = parse_args()
 
-    CKPT_PATH = "checkpoints/ppo_hard_reimuheat_crop_v1.pth"
+    CKPT_PATH = "checkpoints/lunatic_v1.pth"
     os.makedirs("checkpoints", exist_ok=True)
 
-    # ==== 학습 로그 파일 저장 (ckpt 이름과 연동) ====
     pth_name = os.path.splitext(os.path.basename(CKPT_PATH))[0]
     log_path = os.path.join("checkpoints", f"{pth_name}_episode_log.txt")
 
-    # run 헤더 기록
     run_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(log_path, "a", encoding="utf-8") as f:
         f.write("\n========\n")
         f.write(f"[RUN] {run_ts}  episodes={args.episodes}\n")
         f.write("idx\treward\tsurvival_sec\tnote\n")
 
-    # ===== Env =====
     env = GameEnv(screen_mode="low")
     if args.no_render:
         env.show_obs = False
+
+    # ✅ 부팅 상태 출력 + 로비/일러스트 처리
+    boot_print_state(env)
 
     agent = PPOAgent(
         input_channels=4,
@@ -83,7 +97,7 @@ def main():
 
     print("\n[INFO] ESC 중단: Windows 전역 감지(GetAsyncKeyState)")
     print(" - 게임 창이 포커스여도 ESC를 잡고 즉시 종료/저장합니다.\n")
-    time.sleep(1.0)
+    time.sleep(0.7)
 
     stop_requested = False
 
@@ -96,14 +110,21 @@ def main():
 
             print(f"\n========== EPISODE {ep}/{args.episodes} ==========")
 
+            # ✅ 에피소드 시작 전에 현재 화면 위치 한번 찍어주면 편함
+            st = detect_location(env.screen)
+            print(f"[BOOT->EP] state={st.get('state')} selected={st.get('selected_name')}")
+
             if ep == 1:
+                # 커서가 Practice에 맞춰져 있다는 가정
+                print("[MENU] [practice 모드 진입 중...]")
                 enter_practice_from_cursor()
+                print("[MENU] [practice 모드 진입 완료(시퀀스 수행)]")
             else:
                 recover_from_score_to_lobby(env.screen, max_sec=3.0)
                 recover_to_practice_from_lobby()
 
             state = env.reset()
-            ep_t0 = time.time()  # ✅ 생존시간 측정 시작
+            ep_t0 = time.time()
 
             done = False
             total_reward = 0.0
@@ -113,7 +134,6 @@ def main():
             aborted = False
 
             while not done:
-                # ✅ ESC 즉시 중단
                 if esc_pressed():
                     stop_requested = True
                     aborted = True
@@ -140,11 +160,9 @@ def main():
                 if agent.should_update():
                     agent.update(last_state=state, last_done=done)
 
-            # ✅ 에피소드 끝(정상/중단 모두) 마지막 업데이트
             agent.update(last_state=state, last_done=True)
 
-            survival_sec = time.time() - ep_t0  # ✅ 생존시간(초)
-
+            survival_sec = time.time() - ep_t0
             slow_ratio = slow_count / max(1, steps)
             top_actions = action_counter.most_common(5)
             top_actions_str = ";".join(f"{k}:{v}" for k, v in top_actions)
@@ -156,15 +174,12 @@ def main():
                 f"top_actions={top_actions_str} {note}"
             )
 
-            # ✅ 로그 기록 (edge60/top270 완전 제거)
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"({ep}/{args.episodes})\t{total_reward:.6f}\t{survival_sec:.3f}\t{note}\n")
 
-            # ✅ 저장
             agent.save(CKPT_PATH)
             print("[PPO] checkpoint saved")
 
-            # ✅ ESC면 즉시 종료
             if stop_requested:
                 print("[STOP] Training stopped by ESC. Exiting main_ppo.py.")
                 break
@@ -173,7 +188,6 @@ def main():
                 time.sleep(0.3)
 
     finally:
-        # 어떤 예외/중단이든 마지막에 입력 해제
         safe_release_inputs()
 
     print("\n[PPO] Finished.")
