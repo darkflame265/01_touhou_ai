@@ -209,7 +209,44 @@ class PPOAgent:
 
     def load(self, path, load_optimizer=True):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(ckpt["model"])
-        if load_optimizer and "optimizer" in ckpt:
-            self.optimizer.load_state_dict(ckpt["optimizer"])
+
+        print("[LOAD] partial-load loader active")
+
+        # 1) state_dict 가져오기
+        sd = ckpt.get("model", ckpt)
+
+        # 2) 현재 모델의 state_dict
+        cur = self.model.state_dict()
+
+        # 3) 호환되는 키만 골라서 로드 (shape까지 일치해야 함)
+        filtered = {}
+        skipped = []
+        for k, v in sd.items():
+            if (k in cur) and (cur[k].shape == v.shape):
+                filtered[k] = v
+            else:
+                skipped.append(k)
+
+        # 4) 부분 로드 (strict=False)
+        msg = self.model.load_state_dict(filtered, strict=False)
+
+        # 5) 옵티마이저는 구조 바뀌면 거의 항상 깨지니 기본은 끄는 게 안전
+        if load_optimizer:
+            try:
+                if "optimizer" in ckpt:
+                    self.optimizer.load_state_dict(ckpt["optimizer"])
+            except Exception as e:
+                print(f"[WARN] optimizer state not loaded (model changed): {e}")
+
         self.global_step = int(ckpt.get("global_step", self.global_step))
+
+        # 로드 결과 로그 (원인 추적에 매우 도움)
+        try:
+            print("[LOAD] loaded keys:", len(filtered))
+            print("[LOAD] missing keys:", msg.missing_keys)
+            print("[LOAD] unexpected keys:", msg.unexpected_keys)
+            if skipped:
+                print("[LOAD] skipped incompatible keys(sample):", skipped[:10], "...")
+        except Exception:
+            pass
+

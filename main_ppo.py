@@ -107,7 +107,7 @@ def main():
     )
 
     if os.path.exists(CKPT_PATH):
-        agent.load(CKPT_PATH, load_optimizer=True)
+        agent.load(CKPT_PATH, load_optimizer=False)
         print(f"[PPO] checkpoint loaded: {CKPT_PATH}")
     else:
         print("[PPO] no checkpoint found, training from scratch")
