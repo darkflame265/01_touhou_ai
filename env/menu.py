@@ -1,7 +1,9 @@
 # env/menu.py
 import time
+import os
 import ctypes
 from ctypes import wintypes
+
 import win32gui
 import cv2
 import numpy as np
@@ -17,7 +19,6 @@ user32.SendInput.argtypes = (wintypes.UINT, ctypes.c_void_p, ctypes.c_int)
 user32.SendInput.restype = wintypes.UINT
 
 INPUT_KEYBOARD = 1
-
 KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
@@ -72,25 +73,62 @@ class INPUT(ctypes.Structure):
     ]
 
 
+# =========================
 # DirectInput scancodes
+# =========================
 SC_Z = 0x2C
 SC_X = 0x2D
-SC_UP = 0x48  # extended
-
-# Virtual-Key codes (debug용)
-VK_Z = 0x5A
-VK_X = 0x58
-VK_UP = 0x26
+SC_UP = 0x48  # extended=True로 보내야 함
 
 
+# =========================
+# Templates
+# =========================
+TEMPLATES: dict[str, np.ndarray] = {}
+
+
+def _load_gray(path: str) -> np.ndarray:
+    g = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if g is None or g.size == 0:
+        raise RuntimeError(f"template load failed: {path}")
+    return g
+
+
+def load_lobby_templates():
+    """assets/lobby_practice.png, assets/lobby_quit.png 를 로드"""
+    base = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "assets"))
+    TEMPLATES["practice"] = _load_gray(os.path.join(base, "lobby_practice.png"))
+    TEMPLATES["quit"] = _load_gray(os.path.join(base, "lobby_quit.png"))
+    print("[MENU] lobby templates loaded:", list(TEMPLATES.keys()))
+
+
+# 모듈 import 시 자동 로드 시도(없으면 경고만)
+try:
+    load_lobby_templates()
+except Exception as e:
+    print("[MENU][WARN] lobby templates not loaded:", repr(e))
+
+
+def _match_template(gray: np.ndarray, tmpl: np.ndarray) -> float:
+    th, tw = tmpl.shape[:2]
+    if gray.shape[0] < th or gray.shape[1] < tw:
+        return 0.0
+    res = cv2.matchTemplate(gray, tmpl, cv2.TM_CCOEFF_NORMED)
+    return float(res.max())
+
+
+# =========================
+# Focus helper (강제 포커스)
+# =========================
 def focus_touhou_window(max_try: int = 5, sleep: float = 0.05) -> bool:
     """
-    ✅ Windows 포커스 정책 때문에 SetForegroundWindow가 실패하는 경우가 많아서
-    AttachThreadInput 트릭 + topmost 토글까지 써서 최대한 강제로 포커스를 잡는다.
+    SetForegroundWindow가 정책상 실패하는 경우가 많아서
+    - topmost 토글
+    - AttachThreadInput 트릭
+    을 섞어서 포커스를 최대한 잡는다.
 
-    핵심:
-      - user32: GetForegroundWindow, GetWindowThreadProcessId, AttachThreadInput, SetForegroundWindow...
-      - kernel32: GetCurrentThreadId  (※ user32에 없음!)
+    NOTE:
+      GetCurrentThreadId 는 user32가 아니라 kernel32!
     """
     hwnd = find_touhou_window()
     if not hwnd:
@@ -100,7 +138,6 @@ def focus_touhou_window(max_try: int = 5, sleep: float = 0.05) -> bool:
     u32 = ctypes.WinDLL("user32", use_last_error=True)
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
-    # ---------- user32 ----------
     GetForegroundWindow = u32.GetForegroundWindow
     GetForegroundWindow.restype = wintypes.HWND
 
@@ -112,21 +149,21 @@ def focus_touhou_window(max_try: int = 5, sleep: float = 0.05) -> bool:
     AttachThreadInput.argtypes = (wintypes.DWORD, wintypes.DWORD, wintypes.BOOL)
     AttachThreadInput.restype = wintypes.BOOL
 
-    BringWindowToTop = u32.BringWindowToTop
-    BringWindowToTop.argtypes = (wintypes.HWND,)
-    BringWindowToTop.restype = wintypes.BOOL
-
     SetForegroundWindow = u32.SetForegroundWindow
     SetForegroundWindow.argtypes = (wintypes.HWND,)
     SetForegroundWindow.restype = wintypes.BOOL
+
+    SetActiveWindow = u32.SetActiveWindow
+    SetActiveWindow.argtypes = (wintypes.HWND,)
+    SetActiveWindow.restype = wintypes.HWND
 
     SetFocus = u32.SetFocus
     SetFocus.argtypes = (wintypes.HWND,)
     SetFocus.restype = wintypes.HWND
 
-    SetActiveWindow = u32.SetActiveWindow
-    SetActiveWindow.argtypes = (wintypes.HWND,)
-    SetActiveWindow.restype = wintypes.HWND
+    BringWindowToTop = u32.BringWindowToTop
+    BringWindowToTop.argtypes = (wintypes.HWND,)
+    BringWindowToTop.restype = wintypes.BOOL
 
     SetWindowPos = u32.SetWindowPos
     SetWindowPos.argtypes = (
@@ -136,7 +173,6 @@ def focus_touhou_window(max_try: int = 5, sleep: float = 0.05) -> bool:
     )
     SetWindowPos.restype = wintypes.BOOL
 
-    # ---------- kernel32 ----------
     GetCurrentThreadId = k32.GetCurrentThreadId
     GetCurrentThreadId.restype = wintypes.DWORD
 
@@ -147,11 +183,10 @@ def focus_touhou_window(max_try: int = 5, sleep: float = 0.05) -> bool:
     SWP_NOSIZE = 0x0001
     SWP_SHOWWINDOW = 0x0040
 
-    def _is_foreground():
+    def _is_fg():
         return GetForegroundWindow() == hwnd
 
     for _ in range(max_try):
-        # 최소화면 복구
         try:
             win32gui.ShowWindow(hwnd, SW_RESTORE)
         except Exception:
@@ -162,8 +197,7 @@ def focus_touhou_window(max_try: int = 5, sleep: float = 0.05) -> bool:
             win32gui.SetForegroundWindow(hwnd)
         except Exception:
             pass
-
-        if _is_foreground():
+        if _is_fg():
             return True
 
         # 2) topmost 토글
@@ -178,7 +212,7 @@ def focus_touhou_window(max_try: int = 5, sleep: float = 0.05) -> bool:
         except Exception:
             pass
 
-        # 3) AttachThreadInput 트릭
+        # 3) AttachThreadInput
         fg = GetForegroundWindow()
         fg_pid = wintypes.DWORD(0)
         target_pid = wintypes.DWORD(0)
@@ -188,11 +222,8 @@ def focus_touhou_window(max_try: int = 5, sleep: float = 0.05) -> bool:
         cur_tid = GetCurrentThreadId()
 
         try:
-            # fg <-> current
             if fg_tid and fg_tid != cur_tid:
                 AttachThreadInput(fg_tid, cur_tid, True)
-
-            # target <-> current
             if target_tid and target_tid != cur_tid:
                 AttachThreadInput(target_tid, cur_tid, True)
 
@@ -201,7 +232,6 @@ def focus_touhou_window(max_try: int = 5, sleep: float = 0.05) -> bool:
             SetForegroundWindow(hwnd)
 
         finally:
-            # detach (실패해도 무시)
             try:
                 if fg_tid and fg_tid != cur_tid:
                     AttachThreadInput(fg_tid, cur_tid, False)
@@ -213,7 +243,7 @@ def focus_touhou_window(max_try: int = 5, sleep: float = 0.05) -> bool:
             except Exception:
                 pass
 
-        if _is_foreground():
+        if _is_fg():
             return True
 
         time.sleep(sleep)
@@ -222,7 +252,9 @@ def focus_touhou_window(max_try: int = 5, sleep: float = 0.05) -> bool:
     return False
 
 
-
+# =========================
+# SendInput helpers
+# =========================
 def _send_input(inp: INPUT) -> bool:
     arr = (INPUT * 1)(inp)
     p = ctypes.byref(arr[0])
@@ -253,14 +285,13 @@ def tap_scancode(scan: int, extended=False, press=0.02, gap=0.03, label=""):
 
 
 # =========================
-# Menu routines (기존 유지)
+# Menu routines
 # =========================
 def enter_practice_from_cursor():
     print("[MENU] FAST practice entry")
     if not focus_touhou_window():
         print("[MENU][ERR] focus failed -> skip key inputs")
         return
-    focus_touhou_window()
     time.sleep(0.05)
 
     t0 = time.time()
@@ -276,11 +307,10 @@ def recover_to_practice_from_lobby():
     if not focus_touhou_window():
         print("[MENU][ERR] focus failed -> skip key inputs")
         return
-    focus_touhou_window()
     time.sleep(0.05)
 
     for i in range(3):
-        tap_scancode(SC_X, label=f"X{i+1}/10", press=0.02, gap=0.02)
+        tap_scancode(SC_X, label=f"X{i+1}/3", press=0.02, gap=0.02)
         time.sleep(0.2)
 
     for i in range(5):
@@ -296,7 +326,9 @@ def recover_to_practice_from_lobby():
 
 def recover_from_score_to_lobby(screen, max_sec=3.0):
     print("[MENU][RECOVER_SCORE] start")
-    focus_touhou_window()
+    if not focus_touhou_window():
+        print("[MENU][ERR] focus failed -> skip key inputs")
+        return False
     time.sleep(0.05)
 
     t0 = time.time()
@@ -322,7 +354,7 @@ def recover_from_score_to_lobby(screen, max_sec=3.0):
 
 
 # =========================
-# ✅ NEW: Location detection (improved)
+# Location detection (템플릿은 "로비/일러스트 구분"에만)
 # =========================
 def _roi(img_bgr, x1r, y1r, x2r, y2r):
     h, w = img_bgr.shape[:2]
@@ -335,52 +367,24 @@ def _roi(img_bgr, x1r, y1r, x2r, y2r):
     return img_bgr[y1:y2, x1:x2]
 
 
-def _edge_ratio(gray_roi):
-    if gray_roi.size == 0:
-        return 0.0
-    edges = cv2.Canny(gray_roi, 50, 140)
-    return float((edges > 0).mean())
-
-
 def _menu_highlight_score(img_bgr_roi):
     """
-    메뉴에서 '선택된 항목'은 흰색으로 강하게 강조됨.
-    -> 평균 밝기(mean)만 보면 흔들릴 수 있어서:
-       - mean
-       - white_ratio(밝은 픽셀 비율)
-       - contrast(roi 평균 - 주변 평균)
-    을 같이 쓴다.
+    선택된 메뉴는 흰색 글로우가 강함:
+      - mean (밝기)
+      - white_ratio (아주 밝은 픽셀 비율)
+      - std (글로우/윤곽으로 표준편차도 상승)
     """
     if img_bgr_roi.size == 0:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
 
     g = cv2.cvtColor(img_bgr_roi, cv2.COLOR_BGR2GRAY)
-
     mean = float(g.mean())
-    # 밝은 픽셀 비율 (강조 텍스트는 여기서 차이가 크게 남)
-    white_ratio = float((g >= 210).mean())  # 200~225 사이에서 튜닝 가능
+    white_ratio = float((g >= 210).mean())   # 200~225 사이에서 튜닝 가능
+    std = float(g.std())
 
-    # 대비(contrast): roi 내부가 주변보다 얼마나 밝은지
-    # roi 전체 평균만 쓰면 배경 밝기에 영향을 받음 -> 대비로 보정
-    # 간단히 roi의 상/하 패딩을 포함한 약간 큰 영역의 평균을 빼는 방식 대신,
-    # 여기서는 g 자체 std를 보조로 사용
-    contrast = float(g.std())  # 선택된 글자는 윤곽+글로우로 std가 올라감
-
-    # 점수 조합 (가중치는 경험적으로 안정적인 값)
-    score = (mean * 0.6) + (white_ratio * 300.0) + (contrast * 1.2)
-    return score, mean, white_ratio
-
-
-def _red_dom_score(img_bgr_roi):
-    """Quit 빨강 강조 같은 케이스가 있을 때 보조로 쓰는 값."""
-    if img_bgr_roi.size == 0:
-        return 0.0
-    b, g, r = cv2.split(img_bgr_roi)
-    r = r.astype(np.float32)
-    b = b.astype(np.float32)
-    g = g.astype(np.float32)
-    red_dom = float(np.mean(np.maximum(0.0, r - np.maximum(b, g))))
-    return red_dom
+    # 조합 점수 (경험적으로 안정)
+    score = (mean * 0.55) + (white_ratio * 420.0) + (std * 1.1)
+    return score, mean, white_ratio, std
 
 
 def detect_location(screen):
@@ -388,147 +392,130 @@ def detect_location(screen):
     return dict:
       state: 'SCORE' | 'IN_GAME' | 'LOBBY' | 'ILLUST' | 'UNKNOWN'
       selected_name: 'PRACTICE' | 'QUIT' | None
-      scores: debugging numbers
+      scores: debug dict or None
     """
     img = screen.capture()
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # 1) SCORE (가장 명확)
+    # 1) SCORE
     try:
         if screen.is_score_screen(img):
-            return {"state": "SCORE", "selected_name": None, "scores": {}}
+            return {"state": "SCORE", "selected_name": None, "scores": None}
     except Exception:
         pass
 
-    # 2) IN_GAME 힌트(우측 UI 패널)
+    # 2) IN_GAME 힌트 (UI 패널)
+    in_game_hint = False
     try:
         in_game_hint = bool(screen.ui_panel_present(img))
     except Exception:
         in_game_hint = False
 
-    # 3) 로비 메뉴 유무: 오른쪽 메뉴 글자 윤곽(edge) 밀도
-    menu_roi = _roi(img, 0.56, 0.30, 0.96, 0.86)
+    # 3) 로비 메뉴 "존재" 판정: 오른쪽 메뉴 영역에서 템플릿 존재 확인
+    #    (중요: 전체 화면이 아니라 메뉴 ROI로 제한!)
+    menu_roi = _roi(img, 0.55, 0.28, 0.98, 0.92)
     menu_gray = cv2.cvtColor(menu_roi, cv2.COLOR_BGR2GRAY)
-    er = _edge_ratio(menu_gray)
 
-    # 4) PRACTICE / QUIT 선택 판정 (정확도 강화)
-    #    - practice: 'Practice Start' 줄 영역
-    practice_roi = _roi(img, 0.70, 0.43, 0.95, 0.56)
-    practice_score, practice_mean, practice_white = _menu_highlight_score(practice_roi)
+    practice_t = TEMPLATES.get("practice", None)
+    quit_t = TEMPLATES.get("quit", None)
 
-    #    - quit: 'Quit' 줄 영역
-    quit_roi = _roi(img, 0.72, 0.78, 0.93, 0.90)
-    quit_score, quit_mean, quit_white = _menu_highlight_score(quit_roi)
+    practice_tm = _match_template(menu_gray, practice_t) if practice_t is not None else 0.0
+    quit_tm = _match_template(menu_gray, quit_t) if quit_t is not None else 0.0
 
-    # 빨강 우세(보조)
-    red_dom = _red_dom_score(quit_roi)
+    menu_present = (max(practice_tm, quit_tm) >= 0.70)  # 존재 판정은 0.65~0.75 사이 튜닝
 
-    # 5) 상태 결정
-    # 로비 메뉴는 글자 윤곽이 많아서 edge ratio가 올라감
-    if er >= 0.028:
-        state = "LOBBY"
-    elif er < 0.020:
-        state = "ILLUST"
-    else:
-        state = "IN_GAME" if in_game_hint else "UNKNOWN"
+    if not menu_present:
+        # 메뉴가 없으면 보통 일러스트 화면. 다만 게임 중이면 IN_GAME 우선.
+        if in_game_hint:
+            return {"state": "IN_GAME", "selected_name": None, "scores": {"practice_tm": practice_tm, "quit_tm": quit_tm}}
+        return {"state": "ILLUST", "selected_name": None, "scores": {"practice_tm": practice_tm, "quit_tm": quit_tm}}
+
+    # 4) 선택(커서) 판정: 템플릿이 아니라 "강조 점수"로 결정
+    #    (메뉴 존재가 확정된 상태에서만!)
+    practice_roi = _roi(img, 0.67, 0.40, 0.97, 0.58)
+    quit_roi = _roi(img, 0.67, 0.76, 0.97, 0.92)
+
+    pr_score, pr_mean, pr_wr, pr_std = _menu_highlight_score(practice_roi)
+    qt_score, qt_mean, qt_wr, qt_std = _menu_highlight_score(quit_roi)
 
     selected = None
-    if state == "LOBBY":
-        # ✅ 핵심: practice_score vs quit_score 비교로 선택 판단
-        # 점수차가 충분하면 확정.
-        # (이렇게 하면 환경/밝기 변화에 훨씬 강해짐)
-        if practice_score > quit_score + 6.0:
-            selected = "PRACTICE"
-        elif quit_score > practice_score + 6.0:
-            selected = "QUIT"
-        else:
-            # 애매하면 보조 신호로 판단(기준 완화)
-            # 기존보다 훨씬 완화된 기준
-            if red_dom > 10.0:
-                selected = "QUIT"
-            elif practice_mean > 75.0:
-                selected = "PRACTICE"
-            else:
-                selected = None
+    # 점수 차이가 충분히 나야 선택 판정 (흔들림 방지)
+    # margin을 너무 크게 잡으면 None이 많아짐. 8~20 사이에서 조정.
+    margin = 12.0
+    if pr_score >= qt_score + margin:
+        selected = "PRACTICE"
+    elif qt_score >= pr_score + margin:
+        selected = "QUIT"
 
-    scores = {
-        "menu_edge_ratio": er,
-        "practice_score": practice_score,
-        "practice_mean": practice_mean,
-        "practice_white": practice_white,
-        "quit_score": quit_score,
-        "quit_mean": quit_mean,
-        "quit_white": quit_white,
-        "red_dom": red_dom,
+    return {
+        "state": "LOBBY",
+        "selected_name": selected,
+        "scores": {
+            "practice_tm": practice_tm,
+            "quit_tm": quit_tm,
+            "pr_score": pr_score,
+            "qt_score": qt_score,
+            "pr_mean": pr_mean,
+            "qt_mean": qt_mean,
+            "pr_white_ratio": pr_wr,
+            "qt_white_ratio": qt_wr,
+            "pr_std": pr_std,
+            "qt_std": qt_std,
+        }
     }
-    return {"state": state, "selected_name": selected, "scores": scores}
 
 
 # =========================
-# ✅ NEW: Lobby → Practice 커서 정렬
+# Lobby -> Practice align
 # =========================
 def ensure_practice_cursor_from_lobby(screen, verify=True, max_try=3):
     """
-    목표: 로비 메뉴 상태에서
-      1) X 1번 (Quit로 이동)
-      2) UP 5번 (Practice Start로 이동)
-    - verify=True면 마지막에 detect_location으로 PRACTICE 추정 확인
-    - 일러스트 화면(메뉴 없음)이면 Z 1번 눌러 로비 진입 시도
+    - ILLUST면 Z 1회 눌러 LOBBY 진입
+    - LOBBY면:
+        X 1회 (Quit 기준점)
+        UP 5회 (Practice로)
+      이후 verify면 selected=PRACTICE 확인
     """
-     # ✅ 반드시 포커스 확보, 실패시 즉시 중단.
     if not focus_touhou_window():
         print("[MENU][BOOT] focus failed -> cannot send keys")
         return False
 
     for attempt in range(max_try):
         st = detect_location(screen)
-        state = st.get("state")
+        print(f"[MENU][BOOT] try {attempt+1}/{max_try} state={st.get('state')} selected={st.get('selected_name')}")
 
-        if state == "ILLUST":
-            print("[MENU][BOOT] ILLUST detected -> tap Z to enter lobby...")
+        if st.get("state") == "ILLUST":
+            print("[MENU][BOOT] ILLUST detected -> tap Z")
             tap_scancode(SC_Z, label="Z(enter lobby)", press=0.02, gap=0.02)
-            time.sleep(0.35)
+            time.sleep(0.45)
             continue
 
-        if state != "LOBBY":
-            print(f"[MENU][BOOT] not in LOBBY (state={state}) -> cannot align cursor")
+        if st.get("state") != "LOBBY":
+            print(f"[MENU][BOOT] not in LOBBY (state={st.get('state')}) -> cannot align")
             return False
 
-        print("[MENU][BOOT] LOBBY detected -> aligning cursor to PRACTICE...")
-        # 1) Quit로 이동
+        # 기준점: Quit로
         tap_scancode(SC_X, label="X(to Quit)", press=0.02, gap=0.02)
-        time.sleep(0.20)
+        time.sleep(0.25)
 
-        # 2) UP 5번
+        # Practice로 UP 5회
         for i in range(5):
             tap_scancode(SC_UP, extended=True, label=f"UP{i+1}/5", press=0.02, gap=0.02)
             time.sleep(0.12)
 
-        time.sleep(0.20)
+        # 커서 이동/글로우 반영 대기
+        time.sleep(0.30)
 
         if not verify:
             return True
 
         st2 = detect_location(screen)
-        sel = st2.get("selected_name")
-        sc = st2.get("scores", {}) or {}
-        ps = float(sc.get("practice_score", 0.0))
-        qs = float(sc.get("quit_score", 0.0))
+        print(f"[MENU][BOOT] verify result: state={st2.get('state')} selected={st2.get('selected_name')} scores={st2.get('scores')}")
+        if st2.get("state") == "LOBBY" and st2.get("selected_name") == "PRACTICE":
+            return True
 
-        print(f"[MENU][BOOT] verify: state={st2.get('state')} selected={sel} scores={sc}")
-
-        # ✅ 성공 조건(강화):
-        # 1) selected가 PRACTICE면 즉시 성공
-        # 2) selected가 None이어도 practice_score가 quit_score보다 충분히 크면 성공
-        if st2.get("state") == "LOBBY":
-            if sel == "PRACTICE":
-                return True
-            if ps > qs + 6.0:
-                print("[MENU][BOOT] verify: PRACTICE inferred by score (no explicit selected)")
-                return True
-
-
-        # verify 실패해도, 로비라는 것만 확실하면 “실행은 가능”하게 두되 재시도 1~2번
-        print("[MENU][BOOT] verify failed -> retry alignment")
+        print("[MENU][BOOT] verify failed -> retry")
         time.sleep(0.25)
 
+    print("[MENU][BOOT] failed to align PRACTICE after retries")
     return False

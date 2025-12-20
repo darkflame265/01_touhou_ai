@@ -14,3 +14,87 @@ idx	reward	survival_sec	note
 (3/100)	-197.590000	31.391	
 (4/100)	-198.545000	19.159	
 (5/100)	-98.515000	19.286	ABORTED
+
+========
+[RUN] 2025-12-20 13:31:08  episodes=1
+idx	reward	survival_sec	note
+(1/1)	0.555000	7.264	ABORTED
+
+========
+[RUN] 2025-12-20 13:31:35  episodes=1
+idx	reward	survival_sec	note
+(1/1)	0.100000	1.266	ABORTED
+
+========
+[RUN] 2025-12-20 13:32:06  episodes=1
+idx	reward	survival_sec	note
+(1/1)	0.060000	0.789	ABORTED
+
+========
+[RUN] 2025-12-20 13:32:55  episodes=1
+idx	reward	survival_sec	note
+(1/1)	0.125000	1.585	ABORTED
+
+========
+[RUN] 2025-12-20 13:33:09  episodes=1
+idx	reward	survival_sec	note
+(1/1)	0.250000	3.254	ABORTED
+
+========
+[RUN] 2025-12-20 13:33:32  episodes=1
+idx	reward	survival_sec	note
+(1/1)	-197.725000	30.140	
+
+========
+[RUN] 2025-12-20 13:34:14  episodes=1
+idx	reward	survival_sec	note
+(1/1)	0.265000	3.469	ABORTED
+
+========
+[RUN] 2025-12-20 13:34:56  episodes=1
+idx	reward	survival_sec	note
+(1/1)	0.060000	0.774	ABORTED
+
+========
+[RUN] 2025-12-20 13:39:05  episodes=1
+idx	reward	survival_sec	note
+
+========
+[RUN] 2025-12-20 13:43:37  episodes=1
+idx	reward	survival_sec	note
+
+========
+[RUN] 2025-12-20 13:46:07  episodes=1
+idx	reward	survival_sec	note
+
+========
+[RUN] 2025-12-20 13:46:25  episodes=1
+idx	reward	survival_sec	note
+
+========
+[RUN] 2025-12-20 13:47:04  episodes=1
+idx	reward	survival_sec	note
+
+========
+[RUN] 2025-12-20 13:47:43  episodes=1
+idx	reward	survival_sec	note
+
+========
+[RUN] 2025-12-20 13:52:32  episodes=1
+idx	reward	survival_sec	note
+(1/1)	0.085000	1.063	ABORTED
+
+========
+[RUN] 2025-12-20 13:52:51  episodes=1
+idx	reward	survival_sec	note
+
+========
+[RUN] 2025-12-20 13:53:15  episodes=1
+idx	reward	survival_sec	note
+(1/1)	0.310000	3.996	ABORTED
+
+========
+[RUN] 2025-12-20 13:53:36  episodes=2
+idx	reward	survival_sec	note
+(1/2)	-196.770000	42.226	
+(2/2)	-198.025000	25.725	
