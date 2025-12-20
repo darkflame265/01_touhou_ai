@@ -1,9 +1,9 @@
+# env/game_env.py
 import time
 import numpy as np
 
 from env.screen import Screen
 from env.controller import press_keys, set_attack_hold, release_all, set_always_slow
-
 from env.actions import ACTIONS
 
 from env.env_state import EnvState
@@ -17,18 +17,28 @@ from env.reimu_debug_viz import ReimuDebugViz
 from env.action_masking import ActionMasker, MaskingConfig
 
 
-
 class GameEnv:
     """
-    ✅ 루나틱 회피 학습용 (점수 안정화 버전)
+    ✅ 루나틱 회피 학습용 (점수 안정화 + y-존 강제 + 좌표 안정화 버전)
 
     목표:
-    - 에피소드 종료 패널티는 "딱 1개만" 적용 (불확실성 제거)
+    - 에피소드 종료 패널티는 "딱 1개만" 적용
       * death_pen: 죽음으로 종료(피격 포함, flash 포함) -> 동일 패널티
       * abort_pen: 로비/타이틀/ABORTED 등 비정상 종료 -> 동일 패널티
 
     - hit_pen은 "목숨 감소가 확실할 때"만 1회 적용
     - alive + shaping은 매 프레임 누적
+
+    ✅ 추가(핵심):
+    - y < y_floor(위로 올라감) 구간은 "PPO가 무시 못하게" 강하게 패널티
+      1) 존(구간) 진입 순간 큰 패널티 (one-shot)
+      2) 존 체류 시 매 프레임 누적 패널티
+      3) conf가 충분할 때만 적용 (탐지 흔들림 방지)
+
+    ✅ 매우 중요:
+    - shaping/y존 패널티는 _dbg_last(=det None이면 끊김)가 아니라
+      ObsBuilder.last_xy_norm/last_conf(=det 흔들려도 유지)로 계산한다.
+      -> "패널티 적용이 끊겨서 위로 올라가는" 문제를 크게 줄임.
     """
 
     def __init__(self, screen_mode="low"):
@@ -56,28 +66,41 @@ class GameEnv:
         # =========================
         # ✅ Reward (안정화)
         # =========================
-        self.alive_reward = 0.03
+        self.alive_reward = 0.1
 
         # "목숨 감소 1회" 페널티 (에피소드 종료와 별개)
-        self.hit_pen = -15.0
+        self.hit_pen = -5.0
 
         # ✅ 에피소드 종료 패널티는 2개로 단순화
-        self.death_pen = -60.0   # 죽음 종료(최종)
-        self.abort_pen = -80.0   # 로비/타이틀/중단
+        self.death_pen = -5.0   # 죽음 종료(최종)
+        self.abort_pen = -5.0   # 로비/타이틀/중단
 
         # =========================
         # ✅ 위치 shaping (아래쪽 유지)
         # =========================
         self.use_position_shaping = True
-        self.y_floor = 0.60
-        self.y_floor_pen_k = 0.05
 
-        # (선택) 기존 우상단 억제
+        # --- 아래쪽 유지 기준 ---
+        self.y_floor = 0.60
+
+        # ✅ y존 패널티는 "무시 못하게" 2단 구성
+        self.y_zone_enter_pen = 1.5     # 존(위쪽) 진입 순간 1회 큰 패널티 (0.8~3.0)
+        self.y_zone_stay_pen_k = 0.08   # 존 체류 프레임당 패널티 (0.04~0.15)
+
+        # ✅ conf가 이 이상일 때만 y존 패널티 적용 (탐지 흔들림 방지)
+        self.y_pen_conf_thr = 0.02
+
+        # (선택) 기존 우상단 억제 (원하면 끄면 됨)
         self.top_soft_y = 0.20
         self.right_soft_x = 0.80
         self.top_pen_k = 0.020
         self.right_pen_k = 0.010
         self.corner_bonus_pen = 0.015
+
+        # --- y존 상태 머신(진입 감지용) ---
+        self._in_y_bad_zone = False
+        self._last_y_pen = 0.0
+        self._last_pos_pen = 0.0
 
         # Action Masking
         self.mask_cfg = MaskingConfig(
@@ -115,7 +138,6 @@ class GameEnv:
         self.guard.set_terminated()
         self.s.episode_end_reason = str(reason)
         self.s.episode_end_pen = float(pen)
-
         self._ep_add(pen)
 
         self.s.frame_stack.append(self.s.prev_state)
@@ -123,6 +145,10 @@ class GameEnv:
         return stacked_state, float(pen), True
 
     def _get_playfield_xy_norm_for_debug(self):
+        """
+        디버그 창 표시용. (det None이면 끊길 수 있음)
+        _dbg_last: (x_lock,y_lock,conf,logits,x_raw,y_raw) or (x_lock,y_lock,conf,logits)
+        """
         dbg = getattr(self.obs, "_dbg_last", None)
         if dbg is None:
             return None
@@ -136,18 +162,28 @@ class GameEnv:
         except Exception:
             return None
 
+    def _get_playfield_xy_norm_for_shaping(self):
+        """
+        ✅ shaping/y존 패널티용.
+        _dbg_last는 det=None이면 끊기므로 부적합.
+        ObsBuilder가 유지하는 last_xy_norm/last_conf를 사용한다.
+        """
+        x_n, y_n = getattr(self.obs, "last_xy_norm", (None, None))
+        conf = float(getattr(self.obs, "last_conf", 0.0))
+        if x_n is None or y_n is None:
+            return None
+        return float(x_n), float(y_n), conf
+
     def _position_shaping_penalty(self, x_n: float, y_n: float) -> float:
+        """
+        (선택) 우상단/상단/우측 억제용 미세 shaping
+        """
         if not self.use_position_shaping:
+            self._last_pos_pen = 0.0
             return 0.0
 
         pen = 0.0
 
-        # 아래쪽 유지
-        if y_n < self.y_floor:
-            d = (self.y_floor - y_n) / max(1e-6, self.y_floor)
-            pen -= self.y_floor_pen_k * float(d)
-
-        # (선택) 우상단 억제
         if y_n < self.top_soft_y:
             d = (self.top_soft_y - y_n) / max(1e-6, self.top_soft_y)
             pen -= self.top_pen_k * float(d)
@@ -159,7 +195,38 @@ class GameEnv:
         if (y_n < self.top_soft_y) and (x_n > self.right_soft_x):
             pen -= float(self.corner_bonus_pen)
 
+        self._last_pos_pen = float(pen)
         return float(pen)
+
+    def _y_zone_penalty(self, y_n: float, conf: float) -> float:
+        """
+        ✅ 핵심: y < y_floor 구간을 강하게 밀어내는 패널티
+        - conf 충분할 때만 적용 (안정성)
+        - 진입 1회 패널티 + 체류 누적 패널티
+        """
+        self._last_y_pen = 0.0
+
+        # conf 낮으면 "존 상태"도 업데이트하지 않음 (깜빡임/튐 방지)
+        if conf < self.y_pen_conf_thr:
+            return 0.0
+
+        bad = (y_n < self.y_floor)
+
+        if bad and (not self._in_y_bad_zone):
+            # ✅ 진입 순간 1회 패널티
+            self._in_y_bad_zone = True
+            self._last_y_pen -= float(self.y_zone_enter_pen)
+
+        if bad:
+            # ✅ 체류 패널티 (y가 더 위로 갈수록 더 아프게)
+            d = (self.y_floor - y_n) / max(1e-6, self.y_floor)  # 0..1+
+            self._last_y_pen -= float(self.y_zone_stay_pen_k) * float(d)
+
+        if (not bad) and self._in_y_bad_zone:
+            # 존 탈출
+            self._in_y_bad_zone = False
+
+        return float(self._last_y_pen)
 
     # -------------------------
     # Gym API
@@ -181,6 +248,11 @@ class GameEnv:
         self.s.episode_end_reason = ""
         self.s.episode_end_pen = 0.0
         self.s.ep_total_reward = 0.0
+
+        # y존 상태 리셋
+        self._in_y_bad_zone = False
+        self._last_y_pen = 0.0
+        self._last_pos_pen = 0.0
 
         img = self.screen.capture()
 
@@ -246,12 +318,10 @@ class GameEnv:
             ui_ok = self.ui.ui_panel_present(img)
             self.ui.update_ui_absent(ui_ok)
             if self.s.ui_absent_count >= self.s.ui_absent_needed:
-
                 for _ in range(5):
                     release_all()
                     time.sleep(0.02)
-                # ✅ abort로 종료 패널티 1회
-                pen_state, pen_reward, done = self._end_episode(self.abort_pen, "ABORT:UI_ABSENT(loop)")
+                pen_state, pen_reward, _ = self._end_episode(self.abort_pen, "ABORT:UI_ABSENT(loop)")
                 total_reward += pen_reward
                 return pen_state, float(total_reward), True
 
@@ -278,10 +348,17 @@ class GameEnv:
             reward = float(self.alive_reward)
             now = time.time()
 
-            pos_dbg = self._get_playfield_xy_norm_for_debug()
-            if pos_dbg is not None:
-                x_lock, y_lock, conf, logits, x_raw, y_raw = pos_dbg
-                reward += self._position_shaping_penalty(x_lock, y_lock)
+            # ✅ shaping/y존은 "끊기지 않는" last_xy_norm 기반으로 계산
+            pos = self._get_playfield_xy_norm_for_shaping()
+            if pos is not None:
+                x_n, y_n, conf = pos
+
+                # y존 강제(핵심)
+                reward += self._y_zone_penalty(y_n, conf)
+
+                # (선택) 미세 shaping
+                # conf가 너무 낮을 때는 미세 shaping도 꺼도 됨(원하면 아래 줄을 conf 조건으로 감싸도 OK)
+                reward += self._position_shaping_penalty(x_n, y_n)
 
             # ----------
             # ✅ death 판정 1: flash gameover
@@ -291,9 +368,11 @@ class GameEnv:
                 for _ in range(3):
                     release_all()
                     time.sleep(0.02)
-                # ✅ death로 종료 패널티 1회
-                pen_state, pen_reward, done = self._end_episode(self.death_pen, "DEATH:FLASH")
-                total_reward += (reward + pen_reward)  # 마지막 프레임 보상 + 종료 패널티
+
+                # 마지막 프레임 보상 + 종료 패널티
+                _, pen_reward, _ = self._end_episode(self.death_pen, "DEATH:FLASH")
+                total_reward += (reward + pen_reward)
+
                 self.s.prev_state = state
                 self.s.frame_stack.append(self.s.prev_state)
                 return np.stack(self.s.frame_stack, axis=0), float(total_reward), True
@@ -307,7 +386,7 @@ class GameEnv:
                     self.s.lives -= 1
                     self.s.last_hit_time = now
 
-                    # ✅ 목숨 감소는 항상 hit_pen 1회만
+                    # ✅ 목숨 감소는 항상 hit_pen 1회만 (shaping보다 우선)
                     reward = float(self.hit_pen)
 
                     # 마지막 목숨이면 죽음 종료 (death_pen 1회)
@@ -315,8 +394,10 @@ class GameEnv:
                         for _ in range(3):
                             release_all()
                             time.sleep(0.02)
-                        pen_state, pen_reward, done = self._end_episode(self.death_pen, "DEATH:LIVES0")
+
+                        _, pen_reward, _ = self._end_episode(self.death_pen, "DEATH:LIVES0")
                         total_reward += (reward + pen_reward)
+
                         self.s.prev_state = state
                         self.s.frame_stack.append(self.s.prev_state)
                         return np.stack(self.s.frame_stack, axis=0), float(total_reward), True
@@ -330,23 +411,23 @@ class GameEnv:
 
             self.s.prev_ui_lives = ui_now
 
-            # 디버그 표시
+            # 디버그 표시 (표시는 기존 _dbg_last 기반 유지)
             if self.show_reimu_debug:
                 dbg = getattr(self.obs, "_dbg_last", None)
                 if dbg is not None:
                     if len(dbg) >= 6:
-                        x_n, y_n, conf, logits, x_raw, y_raw = dbg[:6]
+                        x_d, y_d, conf_d, logits, x_raw, y_raw = dbg[:6]
                         xy_for_viz = (x_raw, y_raw)
                     else:
-                        x_n, y_n, conf, logits = dbg
-                        xy_for_viz = (x_n, y_n)
+                        x_d, y_d, conf_d, logits = dbg
+                        xy_for_viz = (x_d, y_d)
 
                     play_dbg = self.screen.get_playfield_gray(img)
                     self.reimu_debug.show(
                         play_gray=play_dbg,
                         heatmap_logits=logits,
                         xy_norm=xy_for_viz,
-                        conf=conf,
+                        conf=conf_d,
                         reward=reward,
                         total_reward=self.s.ep_total_reward,
                     )

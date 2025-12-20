@@ -18,14 +18,24 @@ class PPOAgent:
         gae_lambda=0.95,
         clip_eps=0.2,
         vf_coef=0.5,
-        ent_coef=0.01,
-        ent_min=0.0,
-        ent_decay=0.999,
+
+        # =========================
+        # ✅ 탐색(Entropy) 강화 기본값
+        # =========================
+        ent_coef=0.03,        # ✅ 0.02~0.05 추천. (우측 고착이면 0.04도 OK)
+        ent_min=0.01,         # ✅ 0으로 두면 결국 탐색이 완전히 죽어서 고착이 잘 생김
+        ent_decay=0.9999,     # ✅ 0.9995~0.99995 추천. (rollout 256이면 0.9999쯤이 안정적)
+
         rollout_steps=256,
         update_epochs=4,
         mini_batch_size=64,
         device=None,
         max_grad_norm=0.5,
+
+        # =========================
+        # ✅ 엔트로피 warmup (초반 강제 유지)
+        # =========================
+        ent_warmup_updates=50,   # 초반 50회 업데이트 동안 ent_coef를 줄이지 않음
     ):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -41,16 +51,21 @@ class PPOAgent:
         self.clip_eps = clip_eps
         self.vf_coef = vf_coef
 
-        self.ent_coef = ent_coef
-        self.ent_min = ent_min
-        self.ent_decay = ent_decay
+        # entropy
+        self.ent_coef = float(ent_coef)
+        self.ent_min = float(ent_min)
+        self.ent_decay = float(ent_decay)
 
-        self.rollout_steps = rollout_steps
-        self.update_epochs = update_epochs
-        self.mini_batch_size = mini_batch_size
-        self.max_grad_norm = max_grad_norm
+        self.rollout_steps = int(rollout_steps)
+        self.update_epochs = int(update_epochs)
+        self.mini_batch_size = int(mini_batch_size)
+        self.max_grad_norm = float(max_grad_norm)
 
         self.global_step = 0
+
+        # ✅ 업데이트 카운터(엔트로피 warmup용)
+        self.update_step = 0
+        self.ent_warmup_updates = int(ent_warmup_updates)
 
         self.reset_buffer()
 
@@ -78,18 +93,12 @@ class PPOAgent:
         self.dones.append(bool(done))
         self.log_probs.append(float(log_prob))
         self.values.append(float(value))
-
         self.global_step += 1
 
     def should_update(self):
         return len(self.rewards) >= self.rollout_steps
 
     def _compute_gae(self, last_value: float = 0.0):
-        """
-        last_value:
-          - rollout이 에피소드 중간에서 끊겼을 때(done=False로 끝났을 때) 마지막 상태의 V(s)를 넣어 부트스트랩
-          - 에피소드 종료(done=True)로 끝났으면 0.0을 넣으면 됨
-        """
         advantages = []
         returns = []
 
@@ -97,7 +106,7 @@ class PPOAgent:
         next_value = float(last_value)
 
         for t in reversed(range(len(self.rewards))):
-            mask = 1.0 - float(self.dones[t])  # done이면 0, 아니면 1
+            mask = 1.0 - float(self.dones[t])
             delta = self.rewards[t] + self.gamma * next_value * mask - self.values[t]
             gae = delta + self.gamma * self.gae_lambda * mask * gae
 
@@ -108,6 +117,8 @@ class PPOAgent:
 
         returns = np.asarray(returns, dtype=np.float32)
         advantages = np.asarray(advantages, dtype=np.float32)
+
+        # 표준화(기존 유지)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         return returns, advantages
 
@@ -116,7 +127,7 @@ class PPOAgent:
             self.reset_buffer()
             return None
 
-        # ✅ rollout이 중간에서 끊긴 경우 마지막 상태 가치로 부트스트랩
+        # rollout이 중간에서 끊긴 경우 부트스트랩
         last_value = 0.0
         if (last_state is not None) and (not last_done):
             with torch.no_grad():
@@ -166,6 +177,7 @@ class PPOAgent:
 
                 value_loss = F.mse_loss(values.squeeze(-1), mb_returns)
 
+                # ✅ entropy는 "빼는"게 맞음 (탐색 장려)
                 loss = policy_loss + self.vf_coef * value_loss - self.ent_coef * entropy
 
                 self.optimizer.zero_grad(set_to_none=True)
@@ -179,8 +191,12 @@ class PPOAgent:
                 total_entropy += float(entropy.item())
                 steps += 1
 
-        # 엔트로피 계수 decay
-        self.ent_coef = max(self.ent_min, self.ent_coef * self.ent_decay)
+        # =========================
+        # ✅ 엔트로피 decay (warmup 포함)
+        # =========================
+        self.update_step += 1
+        if self.update_step > self.ent_warmup_updates:
+            self.ent_coef = max(self.ent_min, self.ent_coef * self.ent_decay)
 
         self.reset_buffer()
 
@@ -194,6 +210,7 @@ class PPOAgent:
             "entropy": total_entropy / steps,
             "entropy_coef": float(self.ent_coef),
             "rollout_steps": int(n),
+            "update_step": int(self.update_step),
         }
 
     def save(self, path):
@@ -203,6 +220,8 @@ class PPOAgent:
                 "model": self.model.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
                 "global_step": self.global_step,
+                "update_step": self.update_step,
+                "ent_coef": float(self.ent_coef),
             },
             path,
         )
@@ -227,10 +246,10 @@ class PPOAgent:
             else:
                 skipped.append(k)
 
-        # 4) 부분 로드 (strict=False)
+        # 4) 부분 로드
         msg = self.model.load_state_dict(filtered, strict=False)
 
-        # 5) 옵티마이저는 구조 바뀌면 거의 항상 깨지니 기본은 끄는 게 안전
+        # 5) 옵티마이저
         if load_optimizer:
             try:
                 if "optimizer" in ckpt:
@@ -238,15 +257,19 @@ class PPOAgent:
             except Exception as e:
                 print(f"[WARN] optimizer state not loaded (model changed): {e}")
 
+        # 6) 카운터/엔트로피 복원(있으면)
         self.global_step = int(ckpt.get("global_step", self.global_step))
+        self.update_step = int(ckpt.get("update_step", self.update_step))
+        if "ent_coef" in ckpt:
+            self.ent_coef = float(ckpt["ent_coef"])
 
-        # 로드 결과 로그 (원인 추적에 매우 도움)
+        # 로그
         try:
             print("[LOAD] loaded keys:", len(filtered))
             print("[LOAD] missing keys:", msg.missing_keys)
             print("[LOAD] unexpected keys:", msg.unexpected_keys)
             if skipped:
                 print("[LOAD] skipped incompatible keys(sample):", skipped[:10], "...")
+            print(f"[LOAD] global_step={self.global_step} update_step={self.update_step} ent_coef={self.ent_coef:.6f}")
         except Exception:
             pass
-
