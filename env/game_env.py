@@ -250,16 +250,24 @@ class GameEnv:
             if self.show_reimu_debug:
                 dbg = getattr(self.obs, "_dbg_last", None)
                 if dbg is not None:
-                    x_n, y_n, conf, logits = dbg
+                    if len(dbg) >= 6:
+                        x_n, y_n, conf, logits, x_raw, y_raw = dbg[:6]
+                        xy_for_viz = (x_raw, y_raw)   # ✅ 표시용 raw
+                    else:
+                        x_n, y_n, conf, logits = dbg
+                        xy_for_viz = (x_n, y_n)
+
                     play_dbg = self.screen.get_playfield_gray(img)
                     self.reimu_debug.show(
                         play_gray=play_dbg,
                         heatmap_logits=logits,
-                        xy_norm=(x_n, y_n),
+                        xy_norm=xy_for_viz,
                         conf=conf,
                         reward=reward,
                         total_reward=self.s.ep_total_reward,
                     )
+
+
 
             self.s.prev_state = state
             total_reward += reward

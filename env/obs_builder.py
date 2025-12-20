@@ -101,7 +101,7 @@ class ObsBuilder:
         cx = int(np.clip(x_n * playfield_w, 0, playfield_w - 1))
         cy = int(np.clip(y_n * self.H, 0, self.H - 1))
         return cx, cy
-        
+
     def on_player_death(self):
         if hasattr(self.det, "on_player_death"):
             self.det.on_player_death()
@@ -128,8 +128,19 @@ class ObsBuilder:
             else:
                 cx, cy = self.player_center
 
-            # 🔥 디버그용 캐시
-            self._dbg_last = (x_n, y_n, conf, logits)
+            # ✅ raw 좌표(표시용)도 같이 캐시
+            # det.step()에서 last_raw_xy를 저장해두었으니 그걸 가져온다.
+            x_raw, y_raw = x_n, y_n
+            try:
+                if hasattr(self.det, "last_raw_xy") and (self.det.last_raw_xy is not None):
+                    x_raw, y_raw = self.det.last_raw_xy
+            except Exception:
+                pass
+
+            # 🔥 디버그용 캐시: (lock_xy, conf, logits, raw_xy)
+            # GameEnv가 len(dbg)로 분기해서 raw를 우선 표시하게 만들면 됨.
+            self._dbg_last = (x_n, y_n, conf, logits, float(x_raw), float(y_raw))
+
 
 
         # ===== (옵션) fallback: 완전 못 찾는 상황이면 전체 preprocess를 관측으로 =====

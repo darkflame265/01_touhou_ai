@@ -77,6 +77,11 @@ class ReimuDetector:
         self._yy = None
         self._xx = None
 
+        #디버그 표시용.좌표.
+        self.last_raw_xy = None  # (x,y) in [0,1]
+        self.last_lock_xy = None
+
+
     def reset(self):
         self.buf.clear()
         self._ema_xy = None
@@ -167,6 +172,16 @@ class ReimuDetector:
             logits = self._apply_bottom_prior(logits)   # 기존 prior
             logits = self._apply_track_prior(logits)    # ✅ 추적 prior (핵심)
             xy, conf = soft_argmax_2d(logits, beta=self.beta)
+
+        x_raw = float(xy[0, 0].detach().cpu())
+        y_raw = float(xy[0, 1].detach().cpu())
+        c = float(conf[0, 0].detach().cpu())
+
+        # raw 저장 (표시용)
+        x_raw = float(np.clip(x_raw, 0.0, 1.0))
+        y_raw = float(np.clip(y_raw, 0.0, 1.0))
+        self.last_raw_xy = (x_raw, y_raw)
+
 
         x_n = float(xy[0, 0].detach().cpu())
         y_n = float(xy[0, 1].detach().cpu())
