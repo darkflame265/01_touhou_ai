@@ -19,13 +19,10 @@ from env.action_masking import ActionMasker, MaskingConfig
 
 class GameEnv:
     """
-    ✅ 초간단 회피 학습 버전 + 반응속도/관측 개선
-    - 보상: 생존 시 매 프레임 아주 소량(+alive_reward)
-    - 감점: 피격 시 -50, 마지막(게임오버) -100
-    - danger / delta reward 제거
-    - shaping 제거
-    - ✅ action_repeat 줄이고 frame_sleep 줄여서 반응속도 올림
-    - ✅ obs 해상도/크롭 키워서 총알이 보이게 함
+    ✅ 루나틱 회피 학습용 (신호 강화 + 아래쪽 유지 shaping)
+
+    추가:
+    - y < 0.60(너무 위)면 패널티 -> 아래쪽에서만 놀도록 유도
     """
 
     def __init__(self, screen_mode="low"):
@@ -36,57 +33,60 @@ class GameEnv:
         self.ui = UIGuard(self.screen, self.s)
         self.reward_engine = RewardEngine(self.s)
 
-        # =========================
-        # ✅ 반응속도 튜닝 (중요)
-        # =========================
-        # EnvState 기본값을 여기서 강제로 덮어씀
-        self.s.action_repeat = 1          # ✅ 1이 가장 빠름 (추천 시작값)
-        self.s.frame_sleep = 0.012        # ✅ 0.010~0.016 권장(너무 낮으면 불안정 가능)
+        # 반응속도
+        self.s.action_repeat = 1
+        self.s.frame_sleep = 0.012
 
-        # =========================
-        # ✅ 관측 튜닝 (총알이 보이게)
-        # =========================
+        # 관측
         self.debug = DebugViz()
         self.obs = ObsBuilder(
             self.screen,
             debug_viz=self.debug,
-            obs_out_size=128,          # ✅ 다시 84로 (shape 고정)
-            crop_size=256,            # ✅ 총알 보이게 크롭만 키움
-            use_fallback_full_preprocess=True
+            obs_out_size=128,
+            crop_size=256,
+            use_fallback_full_preprocess=True,
         )
 
-        # =========================
-        # ✅ 최소 reward 구성
-        # =========================
-        self.alive_reward = 0.005   # 0.002~0.01 사이에서 조절
-        self.hit_pen = -50.0
-        self.gameover_pen = -100.0
-        self.lobby_pen = -100.0
+        # Reward 스케일
+        self.alive_reward = 0.03
+        self.hit_pen = -15.0
+        self.gameover_pen = -40.0
+        self.lobby_pen = -80.0
 
-        # =========================
-        # ✅ Action Masking (벽 박기 정도만 방지)
-        # =========================
+        # 위치 shaping
+        self.use_position_shaping = True
+
+        # ✅ "아래쪽 유지" 목표 (요청사항)
+        self.y_floor = 0.60          # y가 이보다 작으면(=위로 가면) 패널티
+        self.y_floor_pen_k = 0.05    # ✅ 0.03~0.08 사이에서 조절 (너무 세면 움직임 죽음)
+
+        # (기존) 우상단 억제도 약하게 유지(원치 않으면 False로 꺼도 됨)
+        self.top_soft_y = 0.20
+        self.right_soft_x = 0.80
+        self.top_pen_k = 0.020
+        self.right_pen_k = 0.010
+        self.corner_bonus_pen = 0.015
+
+        # Action Masking
         self.mask_cfg = MaskingConfig(
-            margin_px=90,     # 60~120 권장
+            margin_px=90,
             use_flip=True,
             top_limit_px=None,
             top_limit_fudge_px=10,
         )
         self.masker = ActionMasker(self.screen, self.obs, self.mask_cfg)
 
-        # 실행 기록(학습/디버그용)
+        # 디버그/기록
         self.s.exec_action_idx = 0
         self.s.exec_was_masked = False
+        self._masked_count = 0
+        self._step_count = 0
 
-        # 에피소드 누적(디버그용)
         self.s.ep_total_reward = 0.0
 
         self.show_reimu_debug = True
         self.reimu_debug = ReimuDebugViz()
 
-    # -------------------------
-    # Utils
-    # -------------------------
     def _ep_add(self, x: float):
         try:
             self.s.ep_total_reward += float(x)
@@ -100,9 +100,48 @@ class GameEnv:
         stacked_state = np.stack(self.s.frame_stack, axis=0)
         return stacked_state, float(pen), True
 
-    # -------------------------
-    # Gym API
-    # -------------------------
+    def _get_playfield_xy_norm_for_debug(self):
+        dbg = getattr(self.obs, "_dbg_last", None)
+        if dbg is None:
+            return None
+        try:
+            if len(dbg) >= 6:
+                x_lock, y_lock, conf, logits, x_raw, y_raw = dbg[:6]
+                return float(x_lock), float(y_lock), float(conf), logits, float(x_raw), float(y_raw)
+            else:
+                x_lock, y_lock, conf, logits = dbg
+                return float(x_lock), float(y_lock), float(conf), logits, None, None
+        except Exception:
+            return None
+
+    def _position_shaping_penalty(self, x_n: float, y_n: float) -> float:
+        if not self.use_position_shaping:
+            return 0.0
+
+        pen = 0.0
+
+        # =========================
+        # ✅ 아래쪽 유지: y < 0.60이면 패널티
+        # =========================
+        if y_n < self.y_floor:
+            # y가 0에 가까울수록 더 큰 패널티
+            d = (self.y_floor - y_n) / max(1e-6, self.y_floor)  # 0..1+
+            pen -= self.y_floor_pen_k * float(d)
+
+        # (선택) 기존 우상단 억제
+        if y_n < self.top_soft_y:
+            d = (self.top_soft_y - y_n) / max(1e-6, self.top_soft_y)
+            pen -= self.top_pen_k * float(d)
+
+        if x_n > self.right_soft_x:
+            d = (x_n - self.right_soft_x) / max(1e-6, (1.0 - self.right_soft_x))
+            pen -= self.right_pen_k * float(d)
+
+        if (y_n < self.top_soft_y) and (x_n > self.right_soft_x):
+            pen -= float(self.corner_bonus_pen)
+
+        return float(pen)
+
     def reset(self):
         release_all()
         time.sleep(0.5)
@@ -129,11 +168,11 @@ class GameEnv:
         for _ in range(self.s.frame_stack_size):
             self.s.frame_stack.append(state)
 
-        # masking 실행 기록
         self.s.exec_action_idx = 0
         self.s.exec_was_masked = False
+        self._masked_count = 0
+        self._step_count = 0
 
-        # 에피소드 누적 점수 리셋
         self.s.ep_total_reward = 0.0
 
         if hasattr(self.obs, "reset"):
@@ -152,18 +191,18 @@ class GameEnv:
                 time.sleep(0.02)
             return np.stack(self.s.frame_stack, axis=0), 0.0, True
 
-        # 로비/타이틀 검사
         pre_img = self.screen.capture()
         ui_ok = self.ui.ui_panel_present(pre_img)
         self.ui.update_ui_absent(ui_ok)
         if self.s.ui_absent_count >= self.s.ui_absent_needed:
             return self._end_episode(self.lobby_pen)
 
-        # step 시작 마스킹 + 입력
         masked_idx, was_masked, _ = self.masker.apply_action_mask(action_idx, pre_img)
         action = ACTIONS[masked_idx]
         self.s.exec_action_idx = int(masked_idx)
         self.s.exec_was_masked = bool(was_masked)
+        if was_masked:
+            self._masked_count += 1
 
         release_all()
         press_keys(action.value)
@@ -187,23 +226,31 @@ class GameEnv:
                 self.s.frame_stack.append(self.s.prev_state)
                 return np.stack(self.s.frame_stack, axis=0), float(total_reward), True
 
-            # 관측 업데이트
             state = self.obs.make_state(img)
 
-            # 매 프레임 마스킹 재적용
-            cur_idx, _, _ = self.masker.apply_action_mask(masked_idx, img)
+            cur_idx, cur_was_masked, _ = self.masker.apply_action_mask(masked_idx, img)
             if cur_idx != masked_idx:
                 masked_idx = cur_idx
                 action = ACTIONS[masked_idx]
                 self.s.exec_action_idx = int(masked_idx)
                 self.s.exec_was_masked = True
+                self._masked_count += 1
                 release_all()
                 press_keys(action.value)
+            elif cur_was_masked:
+                self.s.exec_was_masked = True
+                self._masked_count += 1
 
             reward = float(self.alive_reward)
             now = time.time()
 
-            # flash gameover (-100)
+            # 위치 shaping
+            pos_dbg = self._get_playfield_xy_norm_for_debug()
+            if pos_dbg is not None:
+                x_lock, y_lock, conf, logits, x_raw, y_raw = pos_dbg
+                reward += self._position_shaping_penalty(x_lock, y_lock)
+
+            # gameover fx
             _, gameover_fx = self.screen.detect_death(img)
             if gameover_fx:
                 for _ in range(3):
@@ -216,7 +263,6 @@ class GameEnv:
                 self.s.frame_stack.append(self.s.prev_state)
                 return np.stack(self.s.frame_stack, axis=0), float(total_reward), True
 
-            # UI 피격 감지
             ui_now = self.ui.ui_lives_safe(img, ui_ok)
             if (ui_now is not None) and (now - self.s.last_hit_time) > self.s.hit_cooldown:
                 if self.s.prev_ui_lives is not None and ui_now < self.s.prev_ui_lives:
@@ -234,25 +280,23 @@ class GameEnv:
                         self.s.frame_stack.append(self.s.prev_state)
                         return np.stack(self.s.frame_stack, axis=0), float(total_reward), True
 
-                    # 1~2번째 -50
                     try:
-                        trk = getattr(self.obs, "tracker", None)
-                        if trk is not None and hasattr(trk, "on_player_death"):
-                            trk.on_player_death()
+                        if hasattr(self.obs, "on_player_death"):
+                            self.obs.on_player_death()
                     except Exception as e:
-                        print(f"[WARN] tracker.on_player_death failed: {e}")
+                        print(f"[WARN] obs.on_player_death failed: {e}")
 
                     reward = float(self.hit_pen)
 
             self.s.prev_ui_lives = ui_now
 
-            # 디버그 표시
+            # 디버그 표시(기존 그대로)
             if self.show_reimu_debug:
                 dbg = getattr(self.obs, "_dbg_last", None)
                 if dbg is not None:
                     if len(dbg) >= 6:
                         x_n, y_n, conf, logits, x_raw, y_raw = dbg[:6]
-                        xy_for_viz = (x_raw, y_raw)   # ✅ 표시용 raw
+                        xy_for_viz = (x_raw, y_raw)
                     else:
                         x_n, y_n, conf, logits = dbg
                         xy_for_viz = (x_n, y_n)
@@ -267,11 +311,10 @@ class GameEnv:
                         total_reward=self.s.ep_total_reward,
                     )
 
-
-
             self.s.prev_state = state
-            total_reward += reward
-            self._ep_add(reward)
+            total_reward += float(reward)
+            self._ep_add(float(reward))
+            self._step_count += 1
 
         self.s.step_i += 1
         self.s.frame_stack.append(self.s.prev_state)
