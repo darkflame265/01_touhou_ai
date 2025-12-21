@@ -207,8 +207,8 @@ class GameEnv:
         self._last_y_pen = 0.0
 
         # conf 낮으면 "존 상태"도 업데이트하지 않음 (깜빡임/튐 방지)
-        if conf < self.y_pen_conf_thr:
-            return 0.0
+        # if conf < self.y_pen_conf_thr:
+        #     return 0.0
 
         bad = (y_n < self.y_floor)
 
