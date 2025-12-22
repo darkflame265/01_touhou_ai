@@ -1,10 +1,11 @@
 # env/controller.py
 import ctypes
 from ctypes import wintypes
+import time
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 
-# SendInput signature (menu.py와 동일)
+# SendInput signature
 user32.SendInput.argtypes = (wintypes.UINT, ctypes.c_void_p, ctypes.c_int)
 user32.SendInput.restype = wintypes.UINT
 
@@ -14,14 +15,14 @@ KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
 
-# ULONG_PTR 호환 (menu.py와 동일)
+# ULONG_PTR 호환
 if ctypes.sizeof(ctypes.c_void_p) == 8:
     ULONG_PTR = ctypes.c_uint64
 else:
     ULONG_PTR = ctypes.c_uint32
 
 
-# --- Windows INPUT full layout (menu.py와 동일) ---
+# --- Windows INPUT full layout ---
 class MOUSEINPUT(ctypes.Structure):
     _fields_ = [
         ("dx", wintypes.LONG),
@@ -80,14 +81,19 @@ def _send_scancode(scan: int, is_down: bool, extended: bool = False) -> bool:
 
     inp = INPUT()
     inp.type = INPUT_KEYBOARD
-    inp.union.ki = KEYBDINPUT(wVk=0, wScan=scan, dwFlags=flags, time=0, dwExtraInfo=0)
+    inp.union.ki = KEYBDINPUT(
+        wVk=0,
+        wScan=scan,
+        dwFlags=flags,
+        time=0,
+        dwExtraInfo=0,
+    )
     return _send_input(inp)
 
 
 # =========================
 # Key mapping (Scan codes)
 # =========================
-# Set 1 scancodes + extended flags (menu.py와 동일한 개념)
 SCAN = {
     "z": (0x2C, False),
     "shift": (0x2A, False),
@@ -115,6 +121,9 @@ _ATTACK_HOLD = True
 _ALWAYS_SLOW = False
 
 
+# =========================
+# Public controls
+# =========================
 def set_attack_hold(enabled: bool):
     global _ATTACK_HOLD
     _ATTACK_HOLD = bool(enabled)
@@ -124,14 +133,11 @@ def set_attack_hold(enabled: bool):
 
 def set_always_slow(enabled: bool):
     """
-    ✅ enabled=True면 이동 시 Shift(SLOW)를 항상 누른 상태로 유지.
-    - 액션 공간은 그대로 두고, 실제 입력만 전부 SLOW로 바꿈.
-    - reset()에서 호출해 두면 키 꼬임에도 강함.
+    enabled=True면 Shift를 항상 누른 상태로 유지.
     """
     global _ALWAYS_SLOW
     _ALWAYS_SLOW = bool(enabled)
 
-    # 즉시 반영: 켜면 눌러두고, 끄면 해제
     slow_key = MOVE_KEYS["SLOW"]
     if _ALWAYS_SLOW:
         _key_down(slow_key)
@@ -139,6 +145,9 @@ def set_always_slow(enabled: bool):
         _key_up(slow_key)
 
 
+# =========================
+# Low-level key ops
+# =========================
 def _key_down(key: str):
     if key in _HELD:
         return
@@ -153,10 +162,12 @@ def _key_up(key: str):
     _HELD.discard(key)
 
 
+# =========================
+# Main input API
+# =========================
 def press_keys(action_keys):
     """
-    action_keys: ["LEFT"], ["SLOW","UP"], ["UP","RIGHT"] 같은 형태
-    ✅ _ALWAYS_SLOW가 True면 action_keys에 SLOW가 없어도 Shift를 항상 누름.
+    action_keys: ["LEFT"], ["SLOW","UP"], ["UP","RIGHT"] 등
     """
     # 공격키 유지
     if _ATTACK_HOLD:
@@ -164,9 +175,10 @@ def press_keys(action_keys):
     else:
         _key_up(ATTACK_KEY)
 
-    # --- SLOW(shift)는 특별 처리 ---
+    # --- SLOW 처리 ---
     slow_name = "SLOW"
     slow_key = MOVE_KEYS[slow_name]
+
     if _ALWAYS_SLOW:
         _key_down(slow_key)
     else:
@@ -175,8 +187,7 @@ def press_keys(action_keys):
         else:
             _key_up(slow_key)
 
-    # --- 방향키 처리 ---
-    # SLOW는 이미 처리했으니 제외하고 나머지만
+    # --- 방향키 ---
     for name, key in MOVE_KEYS.items():
         if name == slow_name:
             continue
@@ -186,13 +197,47 @@ def press_keys(action_keys):
             _key_up(key)
 
 
-def release_all():
+def release_all(force: bool = False):
     """
     모든 키 해제.
-    - 안전하게 항상 다 풀되, _ALWAYS_SLOW가 켜져 있으면 shift는 유지.
+
+    force=True:
+      - ALWAYS_SLOW 무시
+      - Shift 포함 전부 해제
     """
+    global _ALWAYS_SLOW
+
+    if force:
+        _ALWAYS_SLOW = False
+
     for name, key in MOVE_KEYS.items():
-        if name == "SLOW" and _ALWAYS_SLOW:
-            continue
         _key_up(key)
     _key_up(ATTACK_KEY)
+
+
+# =========================
+# ✅ 종료 안전장치 (핵심)
+# =========================
+def cleanup_inputs_on_exit():
+    """
+    🔥 학습 종료 시 반드시 호출해야 하는 함수 🔥
+
+    - ALWAYS_SLOW 강제 해제
+    - 모든 키 KeyUp
+    - Shift 토글 탭(Down → Up)으로
+      Windows 키 상태 꼬임을 물리적으로 복구
+    """
+    global _ALWAYS_SLOW
+    _ALWAYS_SLOW = False
+
+    # 1) 논리적 해제
+    release_all(force=True)
+    time.sleep(0.05)
+
+    # 2) 물리적 안전장치: Shift 토글 탭
+    sc, ext = SCAN["shift"]
+    _send_scancode(sc, is_down=True, extended=ext)
+    time.sleep(0.03)
+    _send_scancode(sc, is_down=False, extended=ext)
+
+    print("[CTRL] cleanup_inputs_on_exit: Shift safely released")

@@ -9,12 +9,10 @@ import tempfile
 
 from env.game_env import GameEnv
 from env.controller import release_all, set_attack_hold
+from env.controller import cleanup_inputs_on_exit
 from env.menu import (
-    enter_practice_from_cursor,
-    recover_to_practice_from_lobby,
-    recover_from_score_to_lobby,
     detect_location,
-    ensure_practice_cursor_from_lobby,
+    boot_into_practice,
 )
 from env.actions import ACTIONS
 from agents.ppo_agent import PPOAgent
@@ -36,7 +34,6 @@ def parse_args():
 
 
 def safe_release_inputs():
-    # 어떤 예외가 나도 입력이 남지 않게 "무조건" 정리
     try:
         set_attack_hold(False)
     except Exception:
@@ -52,22 +49,29 @@ def boot_print_state(env):
     st = detect_location(env.screen)
     print(f"[BOOT] state={st.get('state')} selected={st.get('selected_name')}")
 
-    if st.get("state") in ("ILLUST", "LOBBY"):
-        ok = ensure_practice_cursor_from_lobby(env.screen, verify=True, max_try=3)
-        if ok:
-            print("[BOOT] [practice 커서 정렬 완료]")
-        else:
-            print("[BOOT] [practice 커서 정렬 실패] (감지가 흔들릴 수 있음. 그래도 시퀀스는 시도함)")
-    elif st.get("state") == "SCORE":
-        print("[BOOT] [SCORE] 감지됨 -> recover_from_score_to_lobby 후 다시 시도 추천")
-    elif st.get("state") == "IN_GAME":
-        print("[BOOT] [IN_GAME] 감지됨 (이미 플레이 중일 수 있음)")
+    # 철학: OTHER는 정상임(난이도/옵션/인게임/일러스트 전부 OTHER)
+    if st.get("state") == "SCORE":
+        print("[BOOT] SCORE 감지됨: boot_into_practice()가 알아서 복구할 것")
+    elif st.get("state") == "LOBBY":
+        print("[BOOT] LOBBY 감지됨: 바로 practice 진입 가능")
     else:
-        print("[BOOT] [UNKNOWN] 감지 실패 (창 크기/밝기/텍스처에 따라 흔들릴 수 있음)")
+        print("[BOOT] OTHER 감지됨: X 연타 복귀로 LOBBY 만들 예정")
+
+
+def ensure_practice_ready_for_episode(env: GameEnv, ep: int) -> bool:
+    """
+    에피소드 시작 전:
+      - 어떤 화면이든 '로비 확보 -> practice 진입'만 확실히 한다.
+      - 상세 상태 분기(옵션/난이도/인게임 등)는 전부 OTHER로 보고 X 연타 복귀.
+    """
+    print(f"[EP_PREP] boot_into_practice (ep={ep})")
+    ok = boot_into_practice(env.screen, max_sec_lobby=12.0)
+    if not ok:
+        print("[EP_PREP][WARN] boot_into_practice failed (will continue and let env/reset try)")
+    return ok
 
 
 def _try_clear_agent_rollout(agent):
-    # 에피소드 중단(abort) 시, 롤아웃 버퍼 찌꺼기 때문에 다음 update가 꼬이는 걸 방지
     for name in ("clear", "reset_buffer", "reset_storage", "clear_buffer", "clear_rollout"):
         fn = getattr(agent, name, None)
         if callable(fn):
@@ -91,22 +95,20 @@ def _safe_save_checkpoint(agent, ckpt_path: str) -> bool:
 
 
 # =========================================================
-# ✅ 누적 최고기록(STATS) 관리
+# ✅ 누적 최고기록(STATS) 관리 (원본 유지)
 # =========================================================
-
 STATS_BEGIN = "# === PPO_STATS_BEGIN ==="
 STATS_END = "# === PPO_STATS_END ==="
 
 
 def _default_stats():
     return {
-        "total_completed": 0,          # ABORT 제외 누적 에피소드 수
-        "best_reward": None,           # float
-        "best_reward_ts": "",          # "YYYY-mm-dd HH:MM:SS"
-        "best_reward_ep": "",          # "(ep/episodes)"
-        "best_reward_run": "",         # run_ts
-
-        "best_survival": None,         # float seconds
+        "total_completed": 0,
+        "best_reward": None,
+        "best_reward_ts": "",
+        "best_reward_ep": "",
+        "best_reward_run": "",
+        "best_survival": None,
         "best_survival_ts": "",
         "best_survival_ep": "",
         "best_survival_run": "",
@@ -131,7 +133,6 @@ def _read_text(path: str) -> str:
 
 
 def _atomic_write(path: str, text: str):
-    # 같은 폴더에 임시파일 -> replace 로 원자적 교체
     d = os.path.dirname(path) or "."
     os.makedirs(d, exist_ok=True)
 
@@ -149,17 +150,10 @@ def _atomic_write(path: str, text: str):
 
 
 def _extract_stats_block(text: str):
-    """
-    로그 파일에서 STATS 블록을 찾아 dict로 파싱.
-    없으면 (None, 원문) 반환.
-    """
     if (STATS_BEGIN not in text) or (STATS_END not in text):
         return None, text
 
-    pattern = re.compile(
-        re.escape(STATS_BEGIN) + r"(.*?)" + re.escape(STATS_END),
-        re.DOTALL
-    )
+    pattern = re.compile(re.escape(STATS_BEGIN) + r"(.*?)" + re.escape(STATS_END), re.DOTALL)
     m = pattern.search(text)
     if not m:
         return None, text
@@ -213,13 +207,8 @@ def _format_stats_block(stats: dict) -> str:
 
 
 def _ensure_stats_header(log_path: str) -> dict:
-    """
-    로그 파일 상단에 STATS 블록이 없으면 생성.
-    있으면 읽어서 stats 반환.
-    """
     text = _read_text(log_path)
     stats, _ = _extract_stats_block(text)
-
     if stats is not None:
         return stats
 
@@ -230,21 +219,14 @@ def _ensure_stats_header(log_path: str) -> dict:
 
 
 def _update_stats_in_file(log_path: str, stats: dict):
-    """
-    log_path 파일의 STATS 블록을 stats로 교체(없으면 상단에 삽입).
-    """
     text = _read_text(log_path)
     cur_stats, _ = _extract_stats_block(text)
 
     new_block = _format_stats_block(stats)
-
     if cur_stats is None:
         new_text = new_block + text
     else:
-        pattern = re.compile(
-            re.escape(STATS_BEGIN) + r".*?" + re.escape(STATS_END) + r"\n?",
-            re.DOTALL
-        )
+        pattern = re.compile(re.escape(STATS_BEGIN) + r".*?" + re.escape(STATS_END) + r"\n?", re.DOTALL)
         new_text = pattern.sub(new_block.strip() + "\n", text, count=1)
 
     _atomic_write(log_path, new_text)
@@ -277,18 +259,11 @@ def _stats_one_line(stats: dict) -> str:
 
 
 def _apply_no_render(env: GameEnv):
-    """
-    --no-render 일 때, 디버그/시각화 창을 확실히 꺼서
-    성능 + 안정성(윈도우 핸들/리소스) 확보.
-    (프로젝트 내부 클래스마다 필드명이 다를 수 있어 try로 안전 처리)
-    """
-    # 1) reimu heatmap/debug 창
     try:
         env.show_reimu_debug = False
     except Exception:
         pass
 
-    # 2) DebugViz 창들
     dbg = getattr(env, "debug", None)
     if dbg is not None:
         for name, val in (
@@ -359,15 +334,13 @@ def main():
             st = detect_location(env.screen)
             print(f"[BOOT->EP] state={st.get('state')} selected={st.get('selected_name')}")
 
-            if ep == 1:
-                print("[MENU] [practice 모드 진입 중...]")
-                enter_practice_from_cursor()
-                print("[MENU] [practice 모드 진입 완료(시퀀스 수행)]")
-            else:
-                recover_from_score_to_lobby(env.screen, max_sec=3.0)
-                recover_to_practice_from_lobby()
+            print("[MENU] [practice 준비/진입 중...]")
+            ensure_practice_ready_for_episode(env, ep)
+            print("[MENU] [practice 준비/진입 완료]")
 
+            safe_release_inputs()  # 에피소드 시작 전 입력 잔상 제거
             state = env.reset()
+
             ep_t0 = time.time()
 
             done = False
@@ -395,7 +368,6 @@ def main():
 
                 next_state, reward, done = env.step(action_idx)
 
-                # ✅ 마스킹 후 실제 실행된 액션 인덱스로 store
                 exec_idx = getattr(env.s, "exec_action_idx", action_idx)
                 agent.store(state, exec_idx, reward, done, log_prob, value)
 
@@ -427,12 +399,10 @@ def main():
                 print("[STOP] Episode aborted -> skip final update & checkpoint save.")
                 break
 
-            # ✅ 정상 종료만 stats 갱신 + 파일 반영
             _maybe_update_records(stats, total_reward, survival_sec, run_ts, ep_tag)
             _update_stats_in_file(log_path, stats)
             print(_stats_one_line(stats))
 
-            # ✅ 정상 종료만 마지막 update + 저장
             agent.update(last_state=state, last_done=True)
 
             ok = _safe_save_checkpoint(agent, CKPT_PATH)
@@ -449,7 +419,7 @@ def main():
                 time.sleep(0.3)
 
     finally:
-        safe_release_inputs()
+        cleanup_inputs_on_exit()
 
     print("\n[PPO] Finished.")
 
