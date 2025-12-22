@@ -19,8 +19,12 @@ from env.action_masking import ActionMasker, MaskingConfig
 
 class GameEnv:
     """
-    ✅ 루나틱 회피 학습용 (점수 안정화 + y-존 강제 + 좌표 안정화 버전)
+    ✅ 루나틱 회피 학습용
     + ✅ 성능 프로파일링(중복 프레임 누적, 구간별 ms)
+    + ✅ (NEW) 중복 프레임 스킵/재캡처 로직
+       - 같은 프레임이 잡히면: (1) 짧게 sleep 후 재캡처 몇 번 시도
+       - 그래도 같은 프레임이면: "관측/판정/마스킹"을 스킵하고
+         prev_state 유지 + reward를 0 처리(기본)
     """
 
     def __init__(self, screen_mode="low"):
@@ -32,7 +36,7 @@ class GameEnv:
         self.reward_engine = RewardEngine(self.s)
 
         # 반응속도
-        self.s.action_repeat = 1
+        self.s.action_repeat = 2
         self.s.frame_sleep = 0.012
 
         # 관측
@@ -91,6 +95,16 @@ class GameEnv:
 
         self.show_reimu_debug = False
         self.reimu_debug = ReimuDebugViz()
+
+        # =========================
+        # ✅ DUP FRAME SKIP (NEW)
+        # =========================
+        # - "중복 프레임"이면 재캡처 몇 번 시도
+        # - 그래도 중복이면 해당 루프는 prev_state 유지 + reward 0 (기본)
+        self.skip_dup_frames = True
+        self.dup_retry = 2          # 추가로 몇 번 더 캡처해볼지
+        self.dup_sleep = 0.002      # 재캡처 사이에 잠깐 대기 (초)
+        self.dup_reward_zero = True # True면 dup 프레임에서 reward=0, False면 alive_reward 유지
 
         # PROFILING
         self._prof_enable = True
@@ -210,19 +224,22 @@ class GameEnv:
             ch0 = img
         return ch0[::8, ::8].astype(np.uint8, copy=False)
 
-    def _prof_update_frame_dup(self, img: np.ndarray):
+    def _prof_update_frame_dup(self, img: np.ndarray) -> bool:
+        """
+        returns: is_dup (bool)
+        """
         if not self._prof_enable:
-            return
+            return False
 
         sample = self._prof_sample_frame(img)
         if sample is None:
-            return
+            return False
 
         if self._prof_prev_sample is None:
             self._prof_prev_sample = sample
             self._prof_last_mean_abs = None
             self._prof_last_max_abs = None
-            return
+            return False
 
         diff = np.abs(sample.astype(np.int16) - self._prof_prev_sample.astype(np.int16))
         mean_abs = float(diff.mean())
@@ -236,6 +253,7 @@ class GameEnv:
             self._prof_dup_count += 1
 
         self._prof_prev_sample = sample
+        return bool(is_dup)
 
     def _prof_maybe_print(self):
         if not self._prof_enable:
@@ -276,6 +294,42 @@ class GameEnv:
             f"capture={cap_ms:.2f} ui={ui_ms:.2f} obs={obs_ms:.2f} mask={mask_ms:.2f} ctrl={ctrl_ms:.2f} dbg={dbg_ms:.2f}"
         )
 
+    # =========================
+    # DUP frame handling
+    # =========================
+    def _capture_with_dup_retry(self):
+        """
+        returns: (img_bgr, is_dup_final)
+        - 첫 캡처가 dup이면 짧게 대기 후 재캡처를 dup_retry 만큼 시도
+        - 최종적으로도 dup이면 is_dup_final=True
+        """
+        # 1) first capture
+        t0 = time.perf_counter()
+        img = self.screen.capture()
+        self._prof_sum_capture += (time.perf_counter() - t0)
+
+        is_dup = self._prof_update_frame_dup(img)
+        if (not self.skip_dup_frames) or (not is_dup):
+            return img, bool(is_dup)
+
+        # 2) retry captures
+        for _ in range(int(self.dup_retry)):
+            if self.dup_sleep > 0:
+                time.sleep(float(self.dup_sleep))
+
+            t1 = time.perf_counter()
+            img2 = self.screen.capture()
+            self._prof_sum_capture += (time.perf_counter() - t1)
+
+            is_dup2 = self._prof_update_frame_dup(img2)
+            if not is_dup2:
+                return img2, False
+
+            img = img2
+            is_dup = True
+
+        return img, True
+
     # -------------------------
     # Gym API
     # -------------------------
@@ -303,9 +357,7 @@ class GameEnv:
 
         self._prof_reset_episode()
 
-        t0 = time.perf_counter()
-        img = self.screen.capture()
-        self._prof_sum_capture += (time.perf_counter() - t0)
+        img, _ = self._capture_with_dup_retry()
 
         # ✅ gray 1회 생성
         g = self.screen.gray(img)
@@ -337,8 +389,6 @@ class GameEnv:
         set_attack_hold(True)
         set_always_slow(True)
 
-        self._prof_update_frame_dup(img)
-
         return np.stack(self.s.frame_stack, axis=0)
 
     def step(self, action_idx):
@@ -351,25 +401,27 @@ class GameEnv:
             return np.stack(self.s.frame_stack, axis=0), 0.0, True
 
         # ---------
-        # Abort 사전 체크
+        # Abort 사전 체크 (pre_img)
         # ---------
-        t0 = time.perf_counter()
-        pre_img = self.screen.capture()
-        self._prof_sum_capture += (time.perf_counter() - t0)
+        pre_img, pre_is_dup = self._capture_with_dup_retry()
 
-        self._prof_update_frame_dup(pre_img)
+        # pre가 dup로 남아버린 경우:
+        # - UI_ABSENT 체크가 흔들릴 수 있으니, 그냥 "이 스텝은 상태 유지"로 넘기는 게 안전
+        # - 입력은 하되, 종료판정은 다음 신선 프레임에서 하게 됨
+        if self.skip_dup_frames and pre_is_dup:
+            # 입력은 그대로 진행
+            ui_ok = True  # update_ui_absent를 건드리지 않음(안정성)
+        else:
+            pre_g = self.screen.gray(pre_img)
 
-        # ✅ gray 1회 생성 (pre_img)
-        pre_g = self.screen.gray(pre_img)
+            t_ui = time.perf_counter()
+            ui_ok = self.screen.ui_panel_present(pre_img, gray=pre_g)
+            self.ui.update_ui_absent(ui_ok)
+            self._prof_sum_ui += (time.perf_counter() - t_ui)
 
-        t1 = time.perf_counter()
-        ui_ok = self.screen.ui_panel_present(pre_img, gray=pre_g)
-        self.ui.update_ui_absent(ui_ok)
-        self._prof_sum_ui += (time.perf_counter() - t1)
-
-        if self.s.ui_absent_count >= self.s.ui_absent_needed:
-            self._prof_maybe_print()
-            return self._end_episode(self.abort_pen, "ABORT:UI_ABSENT(pre)")
+            if self.s.ui_absent_count >= self.s.ui_absent_needed:
+                self._prof_maybe_print()
+                return self._end_episode(self.abort_pen, "ABORT:UI_ABSENT(pre)")
 
         # 입력 + 초기 마스킹
         t2 = time.perf_counter()
@@ -393,15 +445,31 @@ class GameEnv:
             if self.s.frame_sleep > 0:
                 time.sleep(self.s.frame_sleep)
 
-            t4 = time.perf_counter()
-            img = self.screen.capture()
-            self._prof_sum_capture += (time.perf_counter() - t4)
+            img, is_dup = self._capture_with_dup_retry()
 
-            self._prof_update_frame_dup(img)
+            # -------------------------
+            # ✅ DUP FRAME: heavy parts skip
+            # -------------------------
+            if self.skip_dup_frames and is_dup:
+                # 관측/판정/마스킹/디버그 전부 스킵: prev_state 유지
+                # reward는 기본 0 (혹은 alive 유지 옵션)
+                reward = 0.0 if self.dup_reward_zero else float(self.alive_reward)
 
-            # ✅ gray 1회 생성 (img)
+                # 프레임 스택엔 "그대로" prev_state를 한 번 더 넣어줌(시간 진행 느낌 유지)
+                self.s.prev_state = self.s.prev_state
+                self.s.frame_stack.append(self.s.prev_state)
+
+                total_reward += float(reward)
+                self._ep_add(float(reward))
+                self._step_count += 1
+
+                self._prof_maybe_print()
+                return np.stack(self.s.frame_stack, axis=0), float(total_reward), False
+
+            # ✅ gray 1회 생성
             g = self.screen.gray(img)
 
+            # UI 체크
             t5 = time.perf_counter()
             ui_ok = self.screen.ui_panel_present(img, gray=g)
             self.ui.update_ui_absent(ui_ok)
@@ -477,7 +545,6 @@ class GameEnv:
                 if self.s.prev_ui_lives is not None and ui_now < self.s.prev_ui_lives:
                     self.s.lives -= 1
                     self.s.last_hit_time = now
-
                     reward = float(self.hit_pen)
 
                     if self.s.lives <= 0:
@@ -502,7 +569,7 @@ class GameEnv:
 
             self.s.prev_ui_lives = ui_now
 
-            # 디버그(옵션): playfield gray도 재사용 가능
+            # 디버그(옵션)
             if self.show_reimu_debug:
                 tdbg = time.perf_counter()
                 dbg = getattr(self.obs, "_dbg_last", None)
@@ -526,6 +593,8 @@ class GameEnv:
                 self._prof_sum_dbg += (time.perf_counter() - tdbg)
 
             self.s.prev_state = state
+            self.s.frame_stack.append(self.s.prev_state)
+
             total_reward += float(reward)
             self._ep_add(float(reward))
             self._step_count += 1
@@ -533,5 +602,4 @@ class GameEnv:
             self._prof_maybe_print()
 
         self.s.step_i += 1
-        self.s.frame_stack.append(self.s.prev_state)
         return np.stack(self.s.frame_stack, axis=0), float(total_reward), False
