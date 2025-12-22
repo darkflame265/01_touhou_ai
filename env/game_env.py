@@ -23,7 +23,7 @@ class GameEnv:
     + ✅ 성능 프로파일링(중복 프레임 누적, 구간별 ms)
     + ✅ (NEW) 중복 프레임 스킵/재캡처 로직
        - 같은 프레임이 잡히면: (1) 짧게 sleep 후 재캡처 몇 번 시도
-       - 그래도 같은 프레임이면: "관측/판정/마스킹"을 스킵하고
+       - 그래도 같은 프레임이면: "관측/판정/마스킹 재적용"을 스킵하고
          prev_state 유지 + reward를 0 처리(기본)
     """
 
@@ -57,11 +57,9 @@ class GameEnv:
 
         # 위치 shaping
         self.use_position_shaping = True
-
         self.y_floor = 0.60
         self.y_zone_enter_pen = 1.5
         self.y_zone_stay_pen_k = 0.08
-
         self.y_pen_conf_thr = 0.02
 
         self.top_soft_y = 0.20
@@ -99,12 +97,12 @@ class GameEnv:
         # =========================
         # ✅ DUP FRAME SKIP (NEW)
         # =========================
-        # - "중복 프레임"이면 재캡처 몇 번 시도
-        # - 그래도 중복이면 해당 루프는 prev_state 유지 + reward 0 (기본)
         self.skip_dup_frames = True
-        self.dup_retry = 2          # 추가로 몇 번 더 캡처해볼지
-        self.dup_sleep = 0.002      # 재캡처 사이에 잠깐 대기 (초)
-        self.dup_reward_zero = True # True면 dup 프레임에서 reward=0, False면 alive_reward 유지
+        self.dup_retry = 2           # dup면 추가로 몇 번 더 캡처해볼지
+        self.dup_sleep = 0.002       # 재캡처 사이 sleep(초)
+        self.dup_reward_zero = True  # True면 dup 프레임에서 reward=0, False면 alive_reward 유지
+        self.dup_thr_mean_abs = 0.05 # dup 판정 mean_abs 기준(너의 기존값)
+        self.dup_sample_stride = 8   # 샘플 다운샘플 간격(너의 기존값)
 
         # PROFILING
         self._prof_enable = True
@@ -222,7 +220,8 @@ class GameEnv:
             ch0 = img[:, :, 0]
         else:
             ch0 = img
-        return ch0[::8, ::8].astype(np.uint8, copy=False)
+        s = int(self.dup_sample_stride)
+        return ch0[::s, ::s].astype(np.uint8, copy=False)
 
     def _prof_update_frame_dup(self, img: np.ndarray) -> bool:
         """
@@ -248,7 +247,8 @@ class GameEnv:
         self._prof_last_mean_abs = mean_abs
         self._prof_last_max_abs = max_abs
 
-        is_dup = (max_abs == 0) or (mean_abs < 0.05)
+        thr = float(self.dup_thr_mean_abs)
+        is_dup = (max_abs == 0) or (mean_abs < thr)
         if is_dup:
             self._prof_dup_count += 1
 
@@ -275,7 +275,7 @@ class GameEnv:
                 f"[FRAMEDBG] step={self._prof_steps} "
                 f"mean_abs_diff={self._prof_last_mean_abs:.3f} max_abs={self._prof_last_max_abs} fps~{fps:.1f}"
             )
-            if self._prof_last_max_abs == 0 or (self._prof_last_mean_abs < 0.05):
+            if self._prof_last_max_abs == 0 or (self._prof_last_mean_abs < float(self.dup_thr_mean_abs)):
                 print("  [FRAMEDBG][HINT] mean_abs_diff 매우 낮음 -> 같은 프레임 중복 캡처 가능성↑ (frame_sleep 너무 짧을 수 있음)")
 
         dup_ratio = self._prof_dup_count / max(1, self._prof_steps)
@@ -303,7 +303,6 @@ class GameEnv:
         - 첫 캡처가 dup이면 짧게 대기 후 재캡처를 dup_retry 만큼 시도
         - 최종적으로도 dup이면 is_dup_final=True
         """
-        # 1) first capture
         t0 = time.perf_counter()
         img = self.screen.capture()
         self._prof_sum_capture += (time.perf_counter() - t0)
@@ -312,7 +311,6 @@ class GameEnv:
         if (not self.skip_dup_frames) or (not is_dup):
             return img, bool(is_dup)
 
-        # 2) retry captures
         for _ in range(int(self.dup_retry)):
             if self.dup_sleep > 0:
                 time.sleep(float(self.dup_sleep))
@@ -358,8 +356,6 @@ class GameEnv:
         self._prof_reset_episode()
 
         img, _ = self._capture_with_dup_retry()
-
-        # ✅ gray 1회 생성
         g = self.screen.gray(img)
 
         t1 = time.perf_counter()
@@ -405,15 +401,11 @@ class GameEnv:
         # ---------
         pre_img, pre_is_dup = self._capture_with_dup_retry()
 
-        # pre가 dup로 남아버린 경우:
-        # - UI_ABSENT 체크가 흔들릴 수 있으니, 그냥 "이 스텝은 상태 유지"로 넘기는 게 안전
-        # - 입력은 하되, 종료판정은 다음 신선 프레임에서 하게 됨
         if self.skip_dup_frames and pre_is_dup:
-            # 입력은 그대로 진행
-            ui_ok = True  # update_ui_absent를 건드리지 않음(안정성)
+            # dup면 ui_absent 카운터를 건드리지 않는 편이 안전
+            ui_ok = True
         else:
             pre_g = self.screen.gray(pre_img)
-
             t_ui = time.perf_counter()
             ui_ok = self.screen.ui_panel_present(pre_img, gray=pre_g)
             self.ui.update_ui_absent(ui_ok)
@@ -441,6 +433,9 @@ class GameEnv:
 
         total_reward = 0.0
 
+        # ---------
+        # action_repeat loop
+        # ---------
         for _ in range(self.s.action_repeat):
             if self.s.frame_sleep > 0:
                 time.sleep(self.s.frame_sleep)
@@ -451,12 +446,9 @@ class GameEnv:
             # ✅ DUP FRAME: heavy parts skip
             # -------------------------
             if self.skip_dup_frames and is_dup:
-                # 관측/판정/마스킹/디버그 전부 스킵: prev_state 유지
-                # reward는 기본 0 (혹은 alive 유지 옵션)
                 reward = 0.0 if self.dup_reward_zero else float(self.alive_reward)
 
-                # 프레임 스택엔 "그대로" prev_state를 한 번 더 넣어줌(시간 진행 느낌 유지)
-                self.s.prev_state = self.s.prev_state
+                # 관측/판정 스킵: prev_state 유지
                 self.s.frame_stack.append(self.s.prev_state)
 
                 total_reward += float(reward)
@@ -464,9 +456,9 @@ class GameEnv:
                 self._step_count += 1
 
                 self._prof_maybe_print()
-                return np.stack(self.s.frame_stack, axis=0), float(total_reward), False
+                continue  # ⭐ 중요: 여기서 step()을 끝내지 않고 repeat 루프를 계속
 
-            # ✅ gray 1회 생성
+            # fresh frame
             g = self.screen.gray(img)
 
             # UI 체크
