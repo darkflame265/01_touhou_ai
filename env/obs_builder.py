@@ -49,7 +49,7 @@ class ObsBuilder:
         # PROFILING (ObsBuilder 내부)
         # -------------------------
         self.prof_enabled = True
-        self.prof_every = 60
+        self.prof_every = 200
 
         self._prof_i = 0
         self._t_det = 0.0

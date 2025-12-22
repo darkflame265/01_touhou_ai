@@ -44,7 +44,7 @@ class ReimuDetector:
         use_fp16=True,            # CUDA에서만 의미 있음
         track_prior_every=2,       # 1=매프레임, 2=2프레임마다, 3=3프레임마다...
         print_prof=True,          # det 내부 프로파일 출력
-        prof_every=120,            # 몇 step마다 출력할지
+        prof_every=200,            # 몇 step마다 출력할지
     ):
         self.screen = screen
         self.weight_path = weight_path
