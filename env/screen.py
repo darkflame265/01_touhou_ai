@@ -1,3 +1,4 @@
+# env/screen.py
 import win32gui
 import mss
 import cv2
@@ -47,14 +48,19 @@ class Screen:
 
         print("[DEBUG] 잡은 창 제목:", title)
         print("[DEBUG] 창 좌표 (left, top, right, bottom):", rect)
-        self.win_rect = rect  # (left, top, right, bottom)
+        self.win_rect = rect
 
+        # ✅ capture 성능 최적화: rect 캐시 + 주기적으로만 갱신
+        self._cap_rect = rect
+        self._cap_i = 0
+        self._cap_refresh_every = 30  # 30프레임마다 1번만 GetWindowRect
 
-                # ===== Score screen template (optional) =====
+        # ===== Score screen template (optional) =====
         self.score_tmpl = None
-        self.score_roi = None  # (x,y,w,h) in pixels
+        self.score_roi = None  # (x,y,w,h)
 
-        # ui_config.json에서 score_roi 읽기(있으면)
+        print("[SCREEN] optimized capture active")
+
         try:
             cfg_path = os.path.join(os.path.dirname(__file__), "ui_config.json")
             if os.path.exists(cfg_path):
@@ -66,7 +72,6 @@ class Screen:
         except Exception as e:
             print("[DEBUG] ui_config score_roi load failed:", repr(e))
 
-        # assets/score_template.png 로드(있으면)
         try:
             tmpl_path = os.path.join(os.path.dirname(__file__), "..", "assets", "score_template.png")
             tmpl_path = os.path.normpath(tmpl_path)
@@ -82,10 +87,24 @@ class Screen:
         except Exception as e:
             print("[DEBUG] score template load failed:", repr(e))
 
+    def _get_capture_rect(self):
+        # 주기적으로만 갱신
+        self._cap_i += 1
+        if (self._cap_i % self._cap_refresh_every) == 0:
+            try:
+                self._cap_rect = win32gui.GetWindowRect(self.hwnd)
+            except Exception:
+                pass
+        return self._cap_rect
 
     def capture(self):
-        # ✅ 백그라운드 학습: 포커스/복구/전면화 절대 하지 않음
-        left, top, right, bottom = win32gui.GetWindowRect(self.hwnd)
+        """
+        - mss.grab() -> BGRA (uint8)
+        - BGRA[:,:,:3] 는 이미 BGR 이므로 cvtColor(BGRA2BGR) 불필요
+        - 다만 슬라이싱 결과가 non-contiguous일 수 있으니,
+          ✅ '필요할 때만' contiguous로 복사
+        """
+        left, top, right, bottom = self._get_capture_rect()
         monitor = {
             "left": left,
             "top": top,
@@ -93,10 +112,15 @@ class Screen:
             "height": bottom - top
         }
 
-        img = np.array(self.sct.grab(monitor))
-        return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        img = np.asarray(self.sct.grab(monitor))  # BGRA, dtype=uint8
+        bgr = img[..., :3]  # view (대개 non-contiguous 가능)
 
+        # ✅ 조건부 contiguous: 꼭 필요할 때만 복사
+        # OpenCV에 넘기거나 numpy 연산에서 예상치 못한 느림/에러 방지
+        if not bgr.flags["C_CONTIGUOUS"]:
+            bgr = np.ascontiguousarray(bgr)
 
+        return bgr
 
     def get_playfield_gray(self, img_bgr):
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -145,6 +169,24 @@ class Screen:
         )
         return bool(ok)
 
+    def detect_death(self, img_bgr):
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+
+        full_brightness = gray.mean() / 255.0
+        gameover = full_brightness > 0.82
+
+        x1 = int(w * 0.35)
+        x2 = int(w * 0.65)
+        y1 = int(h * 0.60)
+        y2 = int(h * 0.95)
+
+        roi = gray[y1:y2, x1:x2]
+        bright_ratio = float((roi > 225).mean())
+        hit = bright_ratio > 0.020
+
+        return hit, gameover
+
     def playfield_motion_score(self, prev_play_gray, curr_play_gray):
         diff = cv2.absdiff(prev_play_gray, curr_play_gray)
         return float(diff.mean()) / 255.0
@@ -178,32 +220,6 @@ class Screen:
             return float(danger), float(edge_ratio), float(bright_ratio), float(std_norm)
         return float(danger)
 
-    def detect_death(self, img_bgr):
-        """
-        ✅ 'UI 잔기 감소'보다 빠르게 잡기 위한 즉시 신호.
-        - gameover: 전체 화면이 매우 밝아짐(플래시)
-        - hit: 플레이어 근처 ROI에 밝은 플래시가 순간적으로 뜨는 비율
-
-        return: (hit, gameover)
-        """
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        h, w = gray.shape
-
-        full_brightness = gray.mean() / 255.0
-        gameover = full_brightness > 0.82
-
-        # 아래쪽 중앙(플레이어 근처로 가정)
-        x1 = int(w * 0.35)
-        x2 = int(w * 0.65)
-        y1 = int(h * 0.60)
-        y2 = int(h * 0.95)
-
-        roi = gray[y1:y2, x1:x2]
-        bright_ratio = float((roi > 225).mean())
-        hit = bright_ratio > 0.020
-
-        return hit, gameover
-
     def _crop_roi(self, gray: np.ndarray, roi):
         if roi is None:
             return gray, 0, 0
@@ -216,11 +232,6 @@ class Screen:
         return gray[y0:y1, x0:x1], x0, y0
 
     def is_score_screen(self, img_bgr, thr: float = 0.75) -> bool:
-        """
-        score_template.png 기반 템플릿 매칭으로 Score 화면 여부 판정.
-        - thr는 너무 높으면 미검출, 너무 낮으면 오탐.
-        - 기본 0.75로 시작해서 필요하면 0.70~0.85 사이에서 튜닝.
-        """
         if self.score_tmpl is None:
             return False
 
@@ -234,4 +245,3 @@ class Screen:
         res = cv2.matchTemplate(src, self.score_tmpl, cv2.TM_CCOEFF_NORMED)
         _, maxv, _, _ = cv2.minMaxLoc(res)
         return bool(maxv >= float(thr))
-

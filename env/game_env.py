@@ -112,14 +112,14 @@ class GameEnv:
         self.s.episode_end_reason = ""
         self.s.episode_end_pen = 0.0
 
-        self.show_reimu_debug = True
+        self.show_reimu_debug = False
         self.reimu_debug = ReimuDebugViz()
 
         # =========================
         # ✅ PROFILING (NEW)
         # =========================
         self._prof_enable = True
-        self._prof_every_steps = 30  # 30 step마다 1번 출력
+        self._prof_every_steps = 200  # 30 step마다 1번 출력
         self._prof_t0 = time.perf_counter()
         self._prof_last_print_t = self._prof_t0
 

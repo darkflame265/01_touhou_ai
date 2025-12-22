@@ -1,5 +1,6 @@
 # env/reimu_detector.py
 import os
+import time
 from collections import deque
 
 import cv2
@@ -14,11 +15,12 @@ class ReimuDetector:
     Heatmap detector that returns:
       (x_norm, y_norm, conf, logits)
 
-    개선:
-      - tracking prior(가우시안 앵커)로 "잡은 레이무" 유지
-      - 점프 억제(gating)로 보스/아이템에 튀는 현상 감소
-      - lost 누적 시 재탐색(reacquire)
-      - on_player_death()로 죽으면 lock 해제
+    ✅ 성능 최적화 포인트:
+    - deque -> 고정 numpy 버퍼로 교체 (np.stack 제거)
+    - torch 텐서 생성 최소화 (CPU면 from_numpy view, CUDA면 prealloc + copy_)
+    - torch.inference_mode() 사용
+    - (옵션) track_prior를 매 프레임이 아니라 N프레임마다 적용 가능
+    - (옵션) CUDA FP16
     """
 
     def __init__(
@@ -29,13 +31,20 @@ class ReimuDetector:
         prior_strength=1.0,
         ema_alpha=0.75,
         device=None,
+
         # ===== tracking 옵션 =====
-        track_prior_strength=2.0,     # 1.0~4.0 추천 (클수록 현재 트랙 고집)
-        track_prior_sigma=0.08,       # 0.06~0.12 추천 (작을수록 더 빡세게 고정)
-        lock_conf_thr=0.015,          # 이 이상이면 "유효 추적"로 간주
-        max_jump_norm=0.22,           # 한 프레임에 허용할 점프(정규화) (0.18~0.30)
-        jump_allow_conf_gain=1.8,     # 멀리 튈 때 conf가 (기존 대비) 이만큼 좋아야 갈아탐
-        lost_patience=8,              # 튀거나 conf 낮음이 몇 프레임 누적되면 lock 약화/해제
+        track_prior_strength=2.0,
+        track_prior_sigma=0.08,
+        lock_conf_thr=0.015,
+        max_jump_norm=0.22,
+        jump_allow_conf_gain=1.8,
+        lost_patience=8,
+
+        # ===== 성능 옵션 =====
+        use_fp16=True,            # CUDA에서만 의미 있음
+        track_prior_every=2,       # 1=매프레임, 2=2프레임마다, 3=3프레임마다...
+        print_prof=True,          # det 내부 프로파일 출력
+        prof_every=120,            # 몇 step마다 출력할지
     ):
         self.screen = screen
         self.weight_path = weight_path
@@ -51,6 +60,16 @@ class ReimuDetector:
         self.lost_patience = int(lost_patience)
 
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.use_fp16 = bool(use_fp16 and (self.device.type == "cuda"))
+        self.track_prior_every = max(1, int(track_prior_every))
+
+        self.print_prof = bool(print_prof)
+        self.prof_every = max(10, int(prof_every))
+        self._prof_step = 0
+
+        # CUDA 성능 힌트
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
 
         ckpt = torch.load(self.weight_path, map_location=self.device)
         cfg = ckpt.get("cfg", {})
@@ -63,13 +82,24 @@ class ReimuDetector:
         self.model.load_state_dict(ckpt["model"], strict=True)
         self.model.eval()
 
-        self.buf = deque(maxlen=self.stack)
+        if self.use_fp16:
+            self.model.half()
+
+        # ===== 고정 버퍼 (stack,H,W) =====
+        self._buf_np = np.zeros((self.stack, self.out_h, self.out_w), dtype=np.float32)
+        self._buf_len = 0  # warmup 카운트
+
+        # CUDA일 때는 입력 텐서를 미리 만들어두고 copy_만 함
+        self._x_cuda = None
+        if self.device.type == "cuda":
+            dtype = torch.float16 if self.use_fp16 else torch.float32
+            self._x_cuda = torch.empty((1, self.stack, self.out_h, self.out_w), device=self.device, dtype=dtype)
 
         # EMA(부드러운 위치)
         self._ema_xy = None  # np([x,y]) in [0,1]
 
         # Tracking lock 상태
-        self._lock_xy = None        # np([x,y]) : "현재 믿는 레이무"
+        self._lock_xy = None
         self._lock_conf = 0.0
         self._lost_count = 0
 
@@ -77,26 +107,30 @@ class ReimuDetector:
         self._yy = None
         self._xx = None
 
-        #디버그 표시용.좌표.
-        self.last_raw_xy = None  # (x,y) in [0,1]
+        # 디버그 표시용
+        self.last_raw_xy = None
         self.last_lock_xy = None
+
+        # step 카운터
+        self._step_i = 0
+        print(f"[DET] device={self.device} fp16={self.use_fp16} track_prior_every={self.track_prior_every} stack={self.stack} out={self.out_w}x{self.out_h}")
 
 
     def reset(self):
-        self.buf.clear()
+        self._buf_np.fill(0.0)
+        self._buf_len = 0
         self._ema_xy = None
         self._lock_xy = None
         self._lock_conf = 0.0
         self._lost_count = 0
+        self.last_raw_xy = None
+        self.last_lock_xy = None
+        self._step_i = 0
 
     def on_player_death(self):
-        """GameEnv에서 호출해주면: 죽었을 때만 추적 lock을 푼다."""
         self._lock_xy = None
         self._lock_conf = 0.0
         self._lost_count = 0
-        # buf는 유지해도 되지만, 깔끔하게 초기화하고 싶으면 아래 활성화
-        # self.buf.clear()
-        # self._ema_xy = None
 
     def _apply_bottom_prior(self, logits: torch.Tensor) -> torch.Tensor:
         if self.prior_strength <= 0:
@@ -107,7 +141,6 @@ class ReimuDetector:
         return logits - self.prior_strength * penalty
 
     def _ensure_mesh(self, device, dtype):
-        # (1,1,H,W)로 브로드캐스트 가능한 xx/yy
         if (self._yy is None) or (self._xx is None) or (self._yy.device != device) or (self._yy.dtype != dtype):
             yy = torch.linspace(0.0, 1.0, self.out_h, device=device, dtype=dtype).view(1, 1, self.out_h, 1)
             xx = torch.linspace(0.0, 1.0, self.out_w, device=device, dtype=dtype).view(1, 1, 1, self.out_w)
@@ -115,19 +148,13 @@ class ReimuDetector:
             self._xx = xx
 
     def _apply_track_prior(self, logits: torch.Tensor) -> torch.Tensor:
-        """
-        현재 lock_xy 주변에 가우시안 보너스를 더해 logits를 '고정'한다.
-        """
-        if self.track_prior_strength <= 0:
-            return logits
-        if self._lock_xy is None:
+        if self.track_prior_strength <= 0 or self._lock_xy is None:
             return logits
 
         self._ensure_mesh(logits.device, logits.dtype)
         x0 = float(self._lock_xy[0])
         y0 = float(self._lock_xy[1])
 
-        # 가우시안: exp(-d^2 / (2*sigma^2))
         dx = (self._xx - x0)
         dy = (self._yy - y0)
         d2 = dx * dx + dy * dy
@@ -151,103 +178,140 @@ class ReimuDetector:
         dy = float(a_xy[1] - b_xy[1])
         return float((dx * dx + dy * dy) ** 0.5)
 
+    def _push_frame(self, small01: np.ndarray):
+        """
+        small01: (H,W) float32 0..1
+        stack 버퍼에 넣기: [1:] <- [:-1], [0] <- new
+        """
+        if self.stack > 1:
+            self._buf_np[1:] = self._buf_np[:-1]
+        self._buf_np[0] = small01
+        self._buf_len = min(self.stack, self._buf_len + 1)
+
+    def _make_input_tensor(self):
+        """
+        (1, C, H, W) 텐서를 만든다.
+        - CPU: torch.from_numpy로 view (복사 최소)
+        - CUDA: prealloc 텐서에 copy_
+        """
+        if self.device.type == "cpu":
+            x = torch.from_numpy(self._buf_np).unsqueeze(0)  # float32
+            return x
+        else:
+            assert self._x_cuda is not None
+            # numpy -> torch(cpu) -> cuda copy (비용 있지만, 매번 새 텐서 생성은 피함)
+            x_cpu = torch.from_numpy(self._buf_np).unsqueeze(0)  # float32 CPU
+            if self.use_fp16:
+                x_cpu = x_cpu.half()
+            self._x_cuda.copy_(x_cpu, non_blocking=False)
+            return self._x_cuda
+
     def step(self, img_bgr):
         """
         Returns:
           None (during warmup)
           or (x_norm, y_norm, conf, logits)
         """
+        self._step_i += 1
+        t0 = time.perf_counter()
+
+        # 1) playfield gray + resize + normalize
         play = self.screen.get_playfield_gray(img_bgr)  # gray playfield
-        small = cv2.resize(play, (self.out_w, self.out_h), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+        small = cv2.resize(play, (self.out_w, self.out_h), interpolation=cv2.INTER_AREA)
+        small = small.astype(np.float32)
+        small *= (1.0 / 255.0)
+        t1 = time.perf_counter()
 
-        self.buf.appendleft(small)
-        if len(self.buf) < self.stack:
+        # 2) stack buffer push
+        self._push_frame(small)
+        if self._buf_len < self.stack:
             return None
+        t2 = time.perf_counter()
 
-        x_np = np.stack(list(self.buf), axis=0)  # (C,H,W)
-        x = torch.from_numpy(x_np).unsqueeze(0).float().to(self.device)
+        # 3) input tensor 준비
+        x = self._make_input_tensor()
+        if self.device.type == "cuda" and not self.use_fp16:
+            x = x.float()
+        t3 = time.perf_counter()
 
-        with torch.no_grad():
+        # 4) forward
+        with torch.inference_mode():
             logits = self.model(x)                      # (1,1,H,W)
-            logits = self._apply_bottom_prior(logits)   # 기존 prior
-            logits = self._apply_track_prior(logits)    # ✅ 추적 prior (핵심)
+            logits = self._apply_bottom_prior(logits)
+
+            # track prior는 매 프레임이 아니라 N프레임마다만 (옵션)
+            if (self.track_prior_every == 1) or ((self._step_i % self.track_prior_every) == 0):
+                logits = self._apply_track_prior(logits)
+
             xy, conf = soft_argmax_2d(logits, beta=self.beta)
+        t4 = time.perf_counter()
 
-        x_raw = float(xy[0, 0].detach().cpu())
-        y_raw = float(xy[0, 1].detach().cpu())
-        c = float(conf[0, 0].detach().cpu())
+        # 5) to python float (sync point)
+        x_raw = float(xy[0, 0].item())
+        y_raw = float(xy[0, 1].item())
+        c = float(conf[0, 0].item())
 
-        # raw 저장 (표시용)
         x_raw = float(np.clip(x_raw, 0.0, 1.0))
         y_raw = float(np.clip(y_raw, 0.0, 1.0))
         self.last_raw_xy = (x_raw, y_raw)
 
-
-        x_n = float(xy[0, 0].detach().cpu())
-        y_n = float(xy[0, 1].detach().cpu())
-        c = float(conf[0, 0].detach().cpu())
-
-        # EMA로 일단 부드럽게
-        x_n, y_n = self._ema(x_n, y_n)
+        # EMA
+        x_n, y_n = self._ema(x_raw, y_raw)
         x_n = float(np.clip(x_n, 0.0, 1.0))
         y_n = float(np.clip(y_n, 0.0, 1.0))
 
-        # ====== lock / gating 로직 ======
         cur = np.array([x_n, y_n], dtype=np.float32)
 
+        # ====== lock / gating 로직 ======
         if self._lock_xy is None:
-            # 처음 lock: conf가 조금이라도 있으면 시작
             if c >= self.lock_conf_thr:
                 self._lock_xy = cur.copy()
                 self._lock_conf = c
                 self._lost_count = 0
             return x_n, y_n, c, logits
 
-        # 이미 lock 중이면 "점프" 검사
         d = self._dist(cur, self._lock_xy)
 
         if c < self.lock_conf_thr:
-            # conf 낮음 -> lock 유지 + lost 누적
             self._lost_count += 1
             if self._lost_count >= self.lost_patience:
-                # 너무 오래 못 믿으면 lock 약화/해제 (재탐색)
                 self._lock_xy = None
                 self._lock_conf = 0.0
                 self._lost_count = 0
             else:
-                # lock 위치로 되돌려 반환(튐 방지)
                 x_n, y_n = float(self._lock_xy[0]), float(self._lock_xy[1])
             return x_n, y_n, c, logits
 
-        # conf 충분한데 멀리 튄 경우 -> 갈아타기 조건을 더 까다롭게
         if d > self.max_jump_norm:
-            # "정말로 레이무가 순간이동했거나" / "기존 lock이 틀렸거나"만 허용
-            # conf가 이전보다 충분히 좋아야 lock을 바꿈
             if c >= (self._lock_conf * self.jump_allow_conf_gain):
-                # 갈아타기 허용
                 self._lock_xy = cur.copy()
                 self._lock_conf = c
                 self._lost_count = 0
                 return x_n, y_n, c, logits
             else:
-                # 갈아타기 거부 -> lock 유지, lost 누적
                 self._lost_count += 1
                 if self._lost_count >= self.lost_patience:
                     self._lock_xy = None
                     self._lock_conf = 0.0
                     self._lost_count = 0
-                    return x_n, y_n, c, logits  # 다음 프레임부터 재탐색
-                # 반환은 lock로 고정
+                    return x_n, y_n, c, logits
                 x_n, y_n = float(self._lock_xy[0]), float(self._lock_xy[1])
-                # conf는 네트워크 conf를 그대로 주되, obs_builder가 update_thr로 막아주게 둘 수도 있고
                 return x_n, y_n, c, logits
 
-        # 정상 범위 이동: lock을 천천히 업데이트
-        # (너무 빠르게 따라가면 튐에 취약해져서 a를 낮게)
         a = 0.35
         self._lock_xy = (a * cur + (1.0 - a) * self._lock_xy).astype(np.float32)
-        self._lock_conf = max(self._lock_conf * 0.90, c)  # 점진 갱신
+        self._lock_conf = max(self._lock_conf * 0.90, c)
         self._lost_count = 0
 
-        # 반환은 lock 기반으로 (일관성)
+        # ===== 내부 프로파일 출력 =====
+        if self.print_prof:
+            self._prof_step += 1
+            if (self._prof_step % self.prof_every) == 0:
+                ms_pre = (t1 - t0) * 1000.0
+                ms_buf = (t2 - t1) * 1000.0
+                ms_in = (t3 - t2) * 1000.0
+                ms_fw = (t4 - t3) * 1000.0
+                ms_all = (t4 - t0) * 1000.0
+                print(f"[DET_PROF] pre={ms_pre:.2f} buf={ms_buf:.2f} in={ms_in:.2f} fw={ms_fw:.2f} total={ms_all:.2f}")
+
         return float(self._lock_xy[0]), float(self._lock_xy[1]), c, logits
