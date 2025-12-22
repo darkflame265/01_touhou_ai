@@ -263,8 +263,8 @@ def _send_input(inp: INPUT) -> bool:
 
 
 def tap_scancode(scan: int, extended=False, press=0.02, gap=0.03, label=""):
-    if label:
-        print(f"[MENU] tap_sc {label} sc=0x{scan:02X} ext={extended}")
+    # if label:
+    #     print(f"[MENU] tap_sc {label} sc=0x{scan:02X} ext={extended}")
 
     flags_down = KEYEVENTF_SCANCODE | (KEYEVENTF_EXTENDEDKEY if extended else 0)
     flags_up = flags_down | KEYEVENTF_KEYUP
