@@ -31,11 +31,12 @@ def esc_pressed() -> bool:
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--episodes", type=int, default=1)
-    p.add_argument("--no-render", action="store_true", help="disable OBS window")
+    p.add_argument("--no-render", action="store_true", help="disable debug/obs windows")
     return p.parse_args()
 
 
 def safe_release_inputs():
+    # 어떤 예외가 나도 입력이 남지 않게 "무조건" 정리
     try:
         set_attack_hold(False)
     except Exception:
@@ -66,6 +67,7 @@ def boot_print_state(env):
 
 
 def _try_clear_agent_rollout(agent):
+    # 에피소드 중단(abort) 시, 롤아웃 버퍼 찌꺼기 때문에 다음 update가 꼬이는 걸 방지
     for name in ("clear", "reset_buffer", "reset_storage", "clear_buffer", "clear_rollout"):
         fn = getattr(agent, name, None)
         if callable(fn):
@@ -125,12 +127,11 @@ def _read_text(path: str) -> str:
     except FileNotFoundError:
         return ""
     except Exception:
-        # 읽기 실패해도 학습이 죽지 않게
         return ""
 
 
 def _atomic_write(path: str, text: str):
-    # 같은 폴더에 임시파일 -> replace 로 원자적 교체 (Windows에서도 안전한 편)
+    # 같은 폴더에 임시파일 -> replace 로 원자적 교체
     d = os.path.dirname(path) or "."
     os.makedirs(d, exist_ok=True)
 
@@ -155,7 +156,6 @@ def _extract_stats_block(text: str):
     if (STATS_BEGIN not in text) or (STATS_END not in text):
         return None, text
 
-    # BEGIN~END 사이를 추출
     pattern = re.compile(
         re.escape(STATS_BEGIN) + r"(.*?)" + re.escape(STATS_END),
         re.DOTALL
@@ -167,7 +167,6 @@ def _extract_stats_block(text: str):
     block = m.group(1)
     stats = _default_stats()
 
-    # line: key=value 형태
     for line in block.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
@@ -193,7 +192,6 @@ def _extract_stats_block(text: str):
 
 
 def _format_stats_block(stats: dict) -> str:
-    # None이면 빈 문자열로
     br = "" if stats["best_reward"] is None else f"{stats['best_reward']:.6f}"
     bs = "" if stats["best_survival"] is None else f"{stats['best_survival']:.3f}"
 
@@ -226,7 +224,6 @@ def _ensure_stats_header(log_path: str) -> dict:
         return stats
 
     stats = _default_stats()
-    # 새 파일 or 기존 파일 상단에 STATS를 붙임
     new_text = _format_stats_block(stats) + text
     _atomic_write(log_path, new_text)
     return stats
@@ -254,13 +251,8 @@ def _update_stats_in_file(log_path: str, stats: dict):
 
 
 def _maybe_update_records(stats: dict, reward: float, survival_sec: float, run_ts: str, ep_tag: str):
-    """
-    stats를 in-place로 갱신.
-    - reward/survival은 ABORT 제외한 정상 종료 에피소드만 들어온다고 가정.
-    """
     stats["total_completed"] = int(stats.get("total_completed", 0)) + 1
 
-    # best reward
     br = stats.get("best_reward", None)
     if (br is None) or (float(reward) > float(br)):
         stats["best_reward"] = float(reward)
@@ -268,7 +260,6 @@ def _maybe_update_records(stats: dict, reward: float, survival_sec: float, run_t
         stats["best_reward_run"] = run_ts
         stats["best_reward_ep"] = ep_tag
 
-    # best survival
     bs = stats.get("best_survival", None)
     if (bs is None) or (float(survival_sec) > float(bs)):
         stats["best_survival"] = float(survival_sec)
@@ -285,6 +276,34 @@ def _stats_one_line(stats: dict) -> str:
     return f"[STATS] total_completed={stats['total_completed']} | best_reward={br_s} | best_survival={bs_s}"
 
 
+def _apply_no_render(env: GameEnv):
+    """
+    --no-render 일 때, 디버그/시각화 창을 확실히 꺼서
+    성능 + 안정성(윈도우 핸들/리소스) 확보.
+    (프로젝트 내부 클래스마다 필드명이 다를 수 있어 try로 안전 처리)
+    """
+    # 1) reimu heatmap/debug 창
+    try:
+        env.show_reimu_debug = False
+    except Exception:
+        pass
+
+    # 2) DebugViz 창들
+    dbg = getattr(env, "debug", None)
+    if dbg is not None:
+        for name, val in (
+            ("show_tracker_debug", False),
+            ("show_roi_window", False),
+            ("show_full_window", False),
+            ("show_mask_window", False),
+        ):
+            try:
+                if hasattr(dbg, name):
+                    setattr(dbg, name, val)
+            except Exception:
+                pass
+
+
 def main():
     args = parse_args()
 
@@ -294,14 +313,12 @@ def main():
     pth_name = os.path.splitext(os.path.basename(CKPT_PATH))[0]
     log_path = os.path.join(os.path.dirname(CKPT_PATH), f"{pth_name}_episode_log.txt")
 
-    # ✅ STATS 블록 보장 + 로드
     stats = _ensure_stats_header(log_path)
 
     run_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(log_path, "a", encoding="utf-8") as f:
         f.write("\n========\n")
         f.write(f"[RUN] {run_ts}  episodes={args.episodes}\n")
-        # ✅ 이 RUN 시작 시점에서 누적 기록을 한 줄 찍어줌(확인 편함)
         f.write(_stats_one_line(stats) + "\n")
         f.write("idx\treward\tsurvival_sec\tnote\n")
 
@@ -309,7 +326,7 @@ def main():
 
     env = GameEnv(screen_mode="low")
     if args.no_render:
-        env.show_obs = False
+        _apply_no_render(env)
 
     boot_print_state(env)
 
@@ -370,6 +387,7 @@ def main():
                     break
 
                 action_idx, log_prob, value = agent.select_action(state)
+
                 action_name = ACTIONS[action_idx].name
                 action_counter[action_name] += 1
                 if action_name.startswith("SLOW"):
@@ -377,6 +395,7 @@ def main():
 
                 next_state, reward, done = env.step(action_idx)
 
+                # ✅ 마스킹 후 실제 실행된 액션 인덱스로 store
                 exec_idx = getattr(env.s, "exec_action_idx", action_idx)
                 agent.store(state, exec_idx, reward, done, log_prob, value)
 
@@ -400,7 +419,6 @@ def main():
             )
 
             ep_tag = f"({ep}/{args.episodes})"
-
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"{ep_tag}\t{total_reward:.6f}\t{survival_sec:.3f}\t{note}\n")
 
@@ -409,12 +427,12 @@ def main():
                 print("[STOP] Episode aborted -> skip final update & checkpoint save.")
                 break
 
-            # ✅ 정상 종료 에피소드만: stats 갱신 + 파일에 반영
+            # ✅ 정상 종료만 stats 갱신 + 파일 반영
             _maybe_update_records(stats, total_reward, survival_sec, run_ts, ep_tag)
             _update_stats_in_file(log_path, stats)
             print(_stats_one_line(stats))
 
-            # ✅ 정상 종료만 마지막 업데이트 + 저장
+            # ✅ 정상 종료만 마지막 update + 저장
             agent.update(last_state=state, last_done=True)
 
             ok = _safe_save_checkpoint(agent, CKPT_PATH)

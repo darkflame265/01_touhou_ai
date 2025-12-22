@@ -91,7 +91,7 @@ class GameEnv:
         self.s.episode_end_reason = ""
         self.s.episode_end_pen = 0.0
 
-        self.show_reimu_debug = False
+        self.show_reimu_debug = True
         self.reimu_debug = ReimuDebugViz()
 
         # =========================

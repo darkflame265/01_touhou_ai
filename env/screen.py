@@ -96,7 +96,7 @@ class Screen:
         self._use_dxcam = False
         self._dx = None
         self._dx_region = None
-        self._dx_target_fps = 120  # 필요하면 60~240 사이로 조절
+        self._dx_target_fps = 60  # 필요하면 60~240 사이로 조절
 
         self._mss = None
 
