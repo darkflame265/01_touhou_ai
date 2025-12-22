@@ -21,22 +21,6 @@ class GameEnv:
     """
     ✅ 루나틱 회피 학습용 (점수 안정화 + y-존 강제 + 좌표 안정화 버전)
     + ✅ 성능 프로파일링(중복 프레임 누적, 구간별 ms)
-
-    목표:
-    - 에피소드 종료 패널티는 "딱 1개만" 적용
-      * death_pen: 죽음으로 종료(피격 포함, flash 포함) -> 동일 패널티
-      * abort_pen: 로비/타이틀/ABORTED 등 비정상 종료 -> 동일 패널티
-
-    - hit_pen은 "목숨 감소가 확실할 때"만 1회 적용
-    - alive + shaping은 매 프레임 누적
-
-    ✅ y-zone 강제:
-    - y < y_floor(위로 올라감) 구간은 강한 패널티
-      1) 진입 순간 큰 패널티(one-shot)
-      2) 체류 시 매 프레임 누적 패널티
-
-    ✅ 매우 중요:
-    - shaping/y존 패널티는 ObsBuilder.last_xy_norm/last_conf 기반 (끊김 방지)
     """
 
     def __init__(self, screen_mode="low"):
@@ -61,34 +45,27 @@ class GameEnv:
             use_fallback_full_preprocess=True,
         )
 
-        # =========================
-        # ✅ Reward (현재 네 코드 기준)
-        # =========================
+        # Reward
         self.alive_reward = 0.1
         self.hit_pen = -5.0
         self.death_pen = -5.0
         self.abort_pen = -5.0
 
-        # =========================
-        # ✅ 위치 shaping (아래쪽 유지)
-        # =========================
+        # 위치 shaping
         self.use_position_shaping = True
 
         self.y_floor = 0.60
         self.y_zone_enter_pen = 1.5
         self.y_zone_stay_pen_k = 0.08
 
-        # conf threshold (네가 주석처리한 상태 유지하고 싶으면 아래 사용 안 함)
         self.y_pen_conf_thr = 0.02
 
-        # (선택) 기존 우상단 억제
         self.top_soft_y = 0.20
         self.right_soft_x = 0.80
         self.top_pen_k = 0.020
         self.right_pen_k = 0.010
         self.corner_bonus_pen = 0.015
 
-        # --- y존 상태 머신(진입 감지용) ---
         self._in_y_bad_zone = False
         self._last_y_pen = 0.0
         self._last_pos_pen = 0.0
@@ -115,20 +92,16 @@ class GameEnv:
         self.show_reimu_debug = False
         self.reimu_debug = ReimuDebugViz()
 
-        # =========================
-        # ✅ PROFILING (NEW)
-        # =========================
+        # PROFILING
         self._prof_enable = True
-        self._prof_every_steps = 200  # 30 step마다 1번 출력
+        self._prof_every_steps = 200
         self._prof_t0 = time.perf_counter()
         self._prof_last_print_t = self._prof_t0
 
-        # 누적(에피소드 단위)
         self._prof_steps = 0
         self._prof_dup_count = 0
-        self._prof_prev_sample = None  # (H,W) uint8 sample
+        self._prof_prev_sample = None
 
-        # 구간별 누적 시간(에피소드 단위)
         self._prof_sum_capture = 0.0
         self._prof_sum_ui = 0.0
         self._prof_sum_obs = 0.0
@@ -136,7 +109,6 @@ class GameEnv:
         self._prof_sum_ctrl = 0.0
         self._prof_sum_dbg = 0.0
 
-        # 프레임 변화량 로그용 (최근값)
         self._prof_last_mean_abs = None
         self._prof_last_max_abs = None
 
@@ -158,20 +130,6 @@ class GameEnv:
         self.s.frame_stack.append(self.s.prev_state)
         stacked_state = np.stack(self.s.frame_stack, axis=0)
         return stacked_state, float(pen), True
-
-    def _get_playfield_xy_norm_for_debug(self):
-        dbg = getattr(self.obs, "_dbg_last", None)
-        if dbg is None:
-            return None
-        try:
-            if len(dbg) >= 6:
-                x_lock, y_lock, conf, logits, x_raw, y_raw = dbg[:6]
-                return float(x_lock), float(y_lock), float(conf), logits, float(x_raw), float(y_raw)
-            else:
-                x_lock, y_lock, conf, logits = dbg
-                return float(x_lock), float(y_lock), float(conf), logits, None, None
-        except Exception:
-            return None
 
     def _get_playfield_xy_norm_for_shaping(self):
         x_n, y_n = getattr(self.obs, "last_xy_norm", (None, None))
@@ -203,7 +161,7 @@ class GameEnv:
     def _y_zone_penalty(self, y_n: float, conf: float) -> float:
         self._last_y_pen = 0.0
 
-        # ✅ 네가 최근에 conf 조건을 껐었으니, 여기서는 기본 "OFF" 상태 유지:
+        # (기본 OFF 유지)
         # if conf < self.y_pen_conf_thr:
         #     return 0.0
 
@@ -223,7 +181,7 @@ class GameEnv:
         return float(self._last_y_pen)
 
     # =========================
-    # ✅ PROFILING helpers
+    # PROFILING helpers
     # =========================
     def _prof_reset_episode(self):
         self._prof_t0 = time.perf_counter()
@@ -244,18 +202,12 @@ class GameEnv:
         self._prof_last_max_abs = None
 
     def _prof_sample_frame(self, img: np.ndarray) -> np.ndarray:
-        """
-        비용 적게 프레임 중복 감지하기 위한 샘플.
-        - 컬러 전체를 다 쓰지 않고, (채널0)만 다운샘플링해서 uint8로 비교
-        """
         if img is None:
             return None
-        # (H,W,3) 또는 (H,W) 모두 대응
         if img.ndim == 3:
             ch0 = img[:, :, 0]
         else:
             ch0 = img
-        # 다운샘플: 8픽셀 간격
         return ch0[::8, ::8].astype(np.uint8, copy=False)
 
     def _prof_update_frame_dup(self, img: np.ndarray):
@@ -272,7 +224,6 @@ class GameEnv:
             self._prof_last_max_abs = None
             return
 
-        # abs diff
         diff = np.abs(sample.astype(np.int16) - self._prof_prev_sample.astype(np.int16))
         mean_abs = float(diff.mean())
         max_abs = int(diff.max())
@@ -280,9 +231,6 @@ class GameEnv:
         self._prof_last_mean_abs = mean_abs
         self._prof_last_max_abs = max_abs
 
-        # "완전 동일" 또는 "거의 동일" 기준
-        # - 완전 동일: max_abs == 0
-        # - 거의 동일: mean_abs < 0.05 (환경에 따라 조절 가능)
         is_dup = (max_abs == 0) or (mean_abs < 0.05)
         if is_dup:
             self._prof_dup_count += 1
@@ -294,7 +242,6 @@ class GameEnv:
             return
 
         self._prof_steps += 1
-
         if (self._prof_steps % self._prof_every_steps) != 0:
             return
 
@@ -303,7 +250,6 @@ class GameEnv:
         fps = self._prof_every_steps / dt
         self._prof_last_print_t = now
 
-        # 최근 프레임 변화량(마지막 측정값)
         if self._prof_last_mean_abs is None:
             print(f"[FRAMEDBG] step={self._prof_steps} mean_abs_diff=N/A")
         else:
@@ -312,13 +258,11 @@ class GameEnv:
                 f"mean_abs_diff={self._prof_last_mean_abs:.3f} max_abs={self._prof_last_max_abs} fps~{fps:.1f}"
             )
             if self._prof_last_max_abs == 0 or (self._prof_last_mean_abs < 0.05):
-                print("  [FRAMEDBG][HINT] mean_abs_diff가 매우 낮음 -> 같은 프레임 중복 캡처 가능성↑ (frame_sleep 너무 짧을 수 있음)")
+                print("  [FRAMEDBG][HINT] mean_abs_diff 매우 낮음 -> 같은 프레임 중복 캡처 가능성↑ (frame_sleep 너무 짧을 수 있음)")
 
-        # 누적 중복 프레임 비율
         dup_ratio = self._prof_dup_count / max(1, self._prof_steps)
         print(f"  [FRAMEDBG] dup_frames={self._prof_dup_count}/{self._prof_steps} ({dup_ratio*100:.2f}%)")
 
-        # 구간별 평균 ms (step당)
         denom = max(1, self._prof_steps)
         cap_ms = (self._prof_sum_capture / denom) * 1000.0
         ui_ms = (self._prof_sum_ui / denom) * 1000.0
@@ -357,12 +301,14 @@ class GameEnv:
         self._last_y_pen = 0.0
         self._last_pos_pen = 0.0
 
-        # ✅ 프로파일링 리셋(에피소드 시작마다)
         self._prof_reset_episode()
 
         t0 = time.perf_counter()
         img = self.screen.capture()
         self._prof_sum_capture += (time.perf_counter() - t0)
+
+        # ✅ gray 1회 생성
+        g = self.screen.gray(img)
 
         t1 = time.perf_counter()
         state = self.obs.make_state(img)
@@ -371,7 +317,7 @@ class GameEnv:
         self.s.prev_state = state
 
         t2 = time.perf_counter()
-        ui_ok = self.ui.ui_panel_present(img)
+        ui_ok = self.screen.ui_panel_present(img, gray=g)
         self.s.prev_ui_lives = self.ui.ui_lives_safe(img, ui_ok)
         self._prof_sum_ui += (time.perf_counter() - t2)
 
@@ -391,9 +337,7 @@ class GameEnv:
         set_attack_hold(True)
         set_always_slow(True)
 
-        # 첫 프레임 샘플 저장
         self._prof_update_frame_dup(img)
-        # reset은 step 카운트에 포함시키지 않음(혼동 방지)
 
         return np.stack(self.s.frame_stack, axis=0)
 
@@ -407,7 +351,7 @@ class GameEnv:
             return np.stack(self.s.frame_stack, axis=0), 0.0, True
 
         # ---------
-        # 로비/타이틀(Abort) 사전 체크
+        # Abort 사전 체크
         # ---------
         t0 = time.perf_counter()
         pre_img = self.screen.capture()
@@ -415,13 +359,15 @@ class GameEnv:
 
         self._prof_update_frame_dup(pre_img)
 
+        # ✅ gray 1회 생성 (pre_img)
+        pre_g = self.screen.gray(pre_img)
+
         t1 = time.perf_counter()
-        ui_ok = self.ui.ui_panel_present(pre_img)
+        ui_ok = self.screen.ui_panel_present(pre_img, gray=pre_g)
         self.ui.update_ui_absent(ui_ok)
         self._prof_sum_ui += (time.perf_counter() - t1)
 
         if self.s.ui_absent_count >= self.s.ui_absent_needed:
-            # step 출력(원인 추적 편의)
             self._prof_maybe_print()
             return self._end_episode(self.abort_pen, "ABORT:UI_ABSENT(pre)")
 
@@ -453,8 +399,11 @@ class GameEnv:
 
             self._prof_update_frame_dup(img)
 
+            # ✅ gray 1회 생성 (img)
+            g = self.screen.gray(img)
+
             t5 = time.perf_counter()
-            ui_ok = self.ui.ui_panel_present(img)
+            ui_ok = self.screen.ui_panel_present(img, gray=g)
             self.ui.update_ui_absent(ui_ok)
             self._prof_sum_ui += (time.perf_counter() - t5)
 
@@ -493,9 +442,7 @@ class GameEnv:
                 self.s.exec_was_masked = True
                 self._masked_count += 1
 
-            # ----------
-            # 매 프레임 reward
-            # ----------
+            # reward
             reward = float(self.alive_reward)
             now = time.time()
 
@@ -505,11 +452,8 @@ class GameEnv:
                 reward += self._y_zone_penalty(y_n, conf)
                 reward += self._position_shaping_penalty(x_n, y_n)
 
-            # ----------
-            # death 판정: flash gameover
-            # ----------
-            # (detect_death 자체가 비용이 있을 수 있음. 필요하면 여기 또한 시간 측정 가능)
-            _, gameover_fx = self.screen.detect_death(img)
+            # death 판정 (gray 재사용)
+            _, gameover_fx = self.screen.detect_death(img, gray=g)
             if gameover_fx:
                 for _ in range(3):
                     release_all()
@@ -524,9 +468,7 @@ class GameEnv:
                 self._prof_maybe_print()
                 return np.stack(self.s.frame_stack, axis=0), float(total_reward), True
 
-            # ----------
             # hit 판정: UI lives 감소
-            # ----------
             t_ui_lives = time.perf_counter()
             ui_now = self.ui.ui_lives_safe(img, ui_ok)
             self._prof_sum_ui += (time.perf_counter() - t_ui_lives)
@@ -560,10 +502,9 @@ class GameEnv:
 
             self.s.prev_ui_lives = ui_now
 
-            # 디버그 표시 (옵션)
+            # 디버그(옵션): playfield gray도 재사용 가능
             if self.show_reimu_debug:
                 tdbg = time.perf_counter()
-
                 dbg = getattr(self.obs, "_dbg_last", None)
                 if dbg is not None:
                     if len(dbg) >= 6:
@@ -573,7 +514,7 @@ class GameEnv:
                         x_d, y_d, conf_d, logits = dbg
                         xy_for_viz = (x_d, y_d)
 
-                    play_dbg = self.screen.get_playfield_gray(img)
+                    play_dbg = self.screen.get_playfield_gray(img, gray=g)
                     self.reimu_debug.show(
                         play_gray=play_dbg,
                         heatmap_logits=logits,
@@ -582,7 +523,6 @@ class GameEnv:
                         reward=reward,
                         total_reward=self.s.ep_total_reward,
                     )
-
                 self._prof_sum_dbg += (time.perf_counter() - tdbg)
 
             self.s.prev_state = state
@@ -590,7 +530,6 @@ class GameEnv:
             self._ep_add(float(reward))
             self._step_count += 1
 
-            # ✅ 30 step마다 프로파일 출력
             self._prof_maybe_print()
 
         self.s.step_i += 1

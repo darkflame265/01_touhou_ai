@@ -3,10 +3,21 @@ import os
 import json
 import time
 import win32gui
-import win32con
-import mss
 import cv2
 import numpy as np
+
+# dxcam은 선택적으로 import (없으면 mss fallback)
+try:
+    import dxcam
+    _HAS_DXCAM = True
+except Exception:
+    _HAS_DXCAM = False
+
+try:
+    import mss
+    _HAS_MSS = True
+except Exception:
+    _HAS_MSS = False
 
 
 def find_touhou_window():
@@ -48,7 +59,6 @@ class Screen:
 
     def __init__(self, mode="low"):
         self.mode = mode
-        self.sct = mss.mss()
         self.hwnd = find_touhou_window()
 
         if not self.hwnd:
@@ -60,14 +70,14 @@ class Screen:
         print("[DEBUG] 창 좌표 (left, top, right, bottom):", win_rect)
         self.win_rect = win_rect
 
-        # ===== capture 성능 최적화 =====
-        # 1) "윈도우 전체" 대신 "클라이언트 영역"을 캡쳐 (타이틀바/테두리 제외 → 픽셀↓ → capture ms↓)
-        # 2) rect를 캐시하고 주기적으로만 갱신
+        # ===== capture rect cache (client rect in screen coords) =====
         self._cap_rect = self._get_client_rect_screen()  # (l,t,r,b)
         self._cap_i = 0
-        self._cap_refresh_every = 30  # 30프레임마다 갱신
+        self._cap_refresh_every = 30
 
-        print("[SCREEN] optimized capture active (client-rect capture + rect cache)")
+        # ===== gray cache (per-frame) =====
+        self._gray_cache_src_id = None
+        self._gray_cache = None
 
         # ===== Score screen template (optional) =====
         self.score_tmpl = None
@@ -78,13 +88,20 @@ class Screen:
         self.debug_dump_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "debug_caps"))
         self.debug_dump_annotated = True
 
-        # ui_config.json 로드
+        # ui_config / template
         self._load_ui_config()
-
-        # 템플릿 로드
         self._load_score_template()
 
-        # 시작 시 캡쳐영역 덤프 (옵션)
+        # ===== Capture backend =====
+        self._use_dxcam = False
+        self._dx = None
+        self._dx_region = None
+        self._dx_target_fps = 120  # 필요하면 60~240 사이로 조절
+
+        self._mss = None
+
+        self._init_capture_backend()
+
         if self.debug_dump_on_start:
             self.dump_capture_debug(tag="start")
 
@@ -98,17 +115,10 @@ class Screen:
                 with open(cfg_path, "r", encoding="utf-8") as f:
                     cfg = json.load(f)
 
-                # score_roi: 캡쳐 이미지 기준 좌표
                 if "score_roi" in cfg:
                     r = cfg["score_roi"]
                     self.score_roi = (int(r["x"]), int(r["y"]), int(r["w"]), int(r["h"]))
 
-                # 캡쳐 디버그 덤프 옵션
-                # {
-                #   "capture_debug_dump_on_start": true,
-                #   "capture_debug_dump_dir": "C:/01_touhou_ai/debug_caps",
-                #   "capture_debug_dump_annotated": true
-                # }
                 if "capture_debug_dump_on_start" in cfg:
                     self.debug_dump_on_start = bool(cfg["capture_debug_dump_on_start"])
                 if "capture_debug_dump_dir" in cfg and isinstance(cfg["capture_debug_dump_dir"], str):
@@ -141,28 +151,23 @@ class Screen:
     def _get_client_rect_screen(self):
         """
         윈도우 "클라이언트 영역"을 스크린 좌표로 변환해 반환.
-        - GetWindowRect 보다 작아서 캡쳐 픽셀 수 감소 → capture ms 감소에 도움
         """
         try:
-            # 클라이언트 좌표 (0,0)-(w,h)
             l, t, r, b = win32gui.GetClientRect(self.hwnd)
-            # 스크린 좌표로 변환
             (sx0, sy0) = win32gui.ClientToScreen(self.hwnd, (l, t))
             (sx1, sy1) = win32gui.ClientToScreen(self.hwnd, (r, b))
-            # 안전장치: 최소 크기 체크
             if sx1 > sx0 and sy1 > sy0:
-                return (sx0, sy0, sx1, sy1)
+                return (int(sx0), int(sy0), int(sx1), int(sy1))
         except Exception:
             pass
 
-        # 실패 시: window rect로 폴백
         try:
-            return win32gui.GetWindowRect(self.hwnd)
+            L, T, R, B = win32gui.GetWindowRect(self.hwnd)
+            return (int(L), int(T), int(R), int(B))
         except Exception:
             return (0, 0, 640, 480)
 
     def _get_capture_rect(self):
-        # 주기적으로만 갱신
         self._cap_i += 1
         if (self._cap_i % self._cap_refresh_every) == 0:
             try:
@@ -172,39 +177,146 @@ class Screen:
         return self._cap_rect
 
     # ----------------------------
+    # Capture backend init / region sync
+    # ----------------------------
+    def _init_capture_backend(self):
+        # dxcam 우선
+        if _HAS_DXCAM:
+            try:
+                # output_color="BGR"로 바로 받으면 변환 비용 최소
+                self._dx = dxcam.create(output_color="BGR")
+                if self._dx is not None:
+                    self._use_dxcam = True
+                    self._dx_region = self._cap_rect  # (l,t,r,b)
+                    # start() + get_latest_frame() 방식
+                    self._dx.start(region=self._dx_region, target_fps=self._dx_target_fps)
+                    print("[SCREEN] capture backend = dxcam (BGR) | region=", self._dx_region)
+                    return
+            except Exception as e:
+                print("[SCREEN] dxcam init failed -> fallback:", repr(e))
+                self._use_dxcam = False
+                self._dx = None
+
+        # fallback: mss
+        if _HAS_MSS:
+            try:
+                self._mss = mss.mss()
+                print("[SCREEN] capture backend = mss (fallback)")
+                return
+            except Exception as e:
+                print("[SCREEN] mss init failed:", repr(e))
+
+        raise Exception("capture backend init failed: dxcam/mss 모두 사용 불가")
+
+    def _ensure_dxcam_region(self, rect):
+        """
+        client rect가 변하면 dxcam region을 재시작해서 맞춰준다.
+        (창 이동/크기변경 대응)
+        """
+        if not self._use_dxcam or self._dx is None:
+            return
+        rect = (int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3]))
+        if self._dx_region == rect:
+            return
+        try:
+            self._dx.stop()
+        except Exception:
+            pass
+        try:
+            self._dx_region = rect
+            self._dx.start(region=self._dx_region, target_fps=self._dx_target_fps)
+            # print("[SCREEN] dxcam region updated:", self._dx_region)
+        except Exception as e:
+            print("[SCREEN] dxcam region update failed:", repr(e))
+
+    # ----------------------------
+    # Per-frame gray cache
+    # ----------------------------
+    def gray(self, img_bgr: np.ndarray) -> np.ndarray:
+        """
+        같은 img_bgr 객체에 대해 cvtColor를 1번만 수행하도록 캐시.
+        """
+        if img_bgr is None:
+            return None
+        src_id = id(img_bgr)
+        if self._gray_cache_src_id == src_id and self._gray_cache is not None:
+            return self._gray_cache
+        g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        self._gray_cache_src_id = src_id
+        self._gray_cache = g
+        return g
+
+    # ----------------------------
     # Public: capture + debug dump
     # ----------------------------
     def capture(self):
         """
-        - mss.grab() -> BGRA (uint8)
-        - BGRA[:,:,:3] 는 이미 BGR 이므로 cvtColor(BGRA2BGR) 불필요
-        - 다만 슬라이싱 결과가 non-contiguous일 수 있으니,
-          ✅ OpenCV 연산에 넘길 가능성이 있으면 contiguous로 복사
+        return: BGR uint8 (H,W,3)
         """
         left, top, right, bottom = self._get_capture_rect()
         w = max(1, int(right - left))
         h = max(1, int(bottom - top))
 
-        monitor = {"left": int(left), "top": int(top), "width": w, "height": h}
+        # 프레임 바뀌면 gray 캐시도 초기화
+        self._gray_cache_src_id = None
+        self._gray_cache = None
 
-        img = np.asarray(self.sct.grab(monitor))  # BGRA
-        bgr = img[..., :3]  # view
+        if self._use_dxcam and self._dx is not None:
+            # 창 이동/리사이즈 대응
+            self._ensure_dxcam_region((left, top, right, bottom))
 
+            frame = None
+            try:
+                frame = self._dx.get_latest_frame()
+            except Exception:
+                frame = None
+
+            # get_latest_frame()이 None이면, 아주 짧게 1회 재시도
+            if frame is None:
+                time.sleep(0.001)
+                try:
+                    frame = self._dx.get_latest_frame()
+                except Exception:
+                    frame = None
+
+            if frame is None:
+                # 안전 폴백: 빈 프레임
+                return np.zeros((h, w, 3), dtype=np.uint8)
+
+            # dxcam output_color="BGR"이면 이미 BGR
+            bgr = frame
+            if bgr.ndim != 3 or bgr.shape[2] != 3:
+                # 혹시 모르는 포맷 방어
+                bgr = np.asarray(bgr, dtype=np.uint8)
+                if bgr.ndim == 2:
+                    bgr = cv2.cvtColor(bgr, cv2.COLOR_GRAY2BGR)
+                elif bgr.ndim == 3 and bgr.shape[2] == 4:
+                    bgr = bgr[:, :, :3]
+
+            if not bgr.flags["C_CONTIGUOUS"]:
+                bgr = np.ascontiguousarray(bgr)
+            return bgr
+
+        # ---- fallback: mss ----
+        if self._mss is None:
+            # mss가 init 실패했는데 여기까지 오면 예외 케이스
+            return np.zeros((h, w, 3), dtype=np.uint8)
+
+        monitor = {"left": int(left), "top": int(top), "width": int(w), "height": int(h)}
+        img = np.asarray(self._mss.grab(monitor))  # BGRA
+        bgr = img[..., :3]
         if not bgr.flags["C_CONTIGUOUS"]:
             bgr = np.ascontiguousarray(bgr)
-
         return bgr
 
     def dump_capture_debug(self, tag: str = "manual"):
         """
-        현재 캡쳐 영역이 어디인지 확인용:
-        - debug_dump_dir/capture_debug_raw_{tag}.png
-        - debug_dump_dir/capture_debug_annotated_{tag}.png (playfield/ui/score_roi 표시)
+        현재 캡쳐 영역이 어디인지 확인용 덤프.
+        - raw / annotated 저장
         """
         try:
             _safe_mkdir(self.debug_dump_dir)
 
-            # 최신 rect로 갱신 후 캡쳐
             self._cap_rect = self._get_client_rect_screen()
             img = self.capture()
 
@@ -212,50 +324,46 @@ class Screen:
             raw_path = os.path.join(self.debug_dump_dir, f"capture_debug_raw_{tag}_{ts}.png")
             cv2.imwrite(raw_path, img)
 
+            ann_path = None
             if self.debug_dump_annotated:
                 ann = img.copy()
-                h, w = ann.shape[:2]
+                H, W = ann.shape[:2]
 
-                # playfield 분리선 표시
-                x_pf = int(w * self.PLAYFIELD_RIGHT_RATIO)
-                cv2.line(ann, (x_pf, 0), (x_pf, h - 1), (0, 255, 255), 2)
+                x_pf = int(W * self.PLAYFIELD_RIGHT_RATIO)
+                cv2.line(ann, (x_pf, 0), (x_pf, H - 1), (0, 255, 255), 2)
 
-                # playfield crop 영역 표시 (현재는 full height 기준)
-                # get_playfield_gray에서 실제로 쓰는 crop을 BGR 좌표로 역산해서 표시
-                # (주의: get_playfield_gray는 playfield에서 또 crop 적용)
                 pw = x_pf
-                ph = h
+                ph = H
                 x1 = int(pw * self.PLAYFIELD_LEFT_CROP)
                 x2 = int(pw * self.PLAYFIELD_RIGHT_CROP)
                 y1 = int(ph * self.PLAYFIELD_TOP_CROP)
                 y2 = int(ph * self.PLAYFIELD_BOTTOM_CROP)
                 cv2.rectangle(ann, (x1, y1), (x2 - 1, y2 - 1), (0, 255, 0), 2)
 
-                # score_roi 표시 (설정되어 있으면)
                 if self.score_roi is not None:
                     sx, sy, sw, sh = self.score_roi
                     cv2.rectangle(ann, (sx, sy), (sx + sw - 1, sy + sh - 1), (255, 0, 0), 2)
 
-                # 캡쳐 rect 정보 텍스트
                 l, t, r, b = self._cap_rect
-                txt = f"CAP_RECT client(screen) L{l} T{t} R{r} B{b} | size={w}x{h}"
+                txt = f"CAP_RECT client(screen) L{l} T{t} R{r} B{b} | size={W}x{H}"
                 cv2.putText(ann, txt, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
 
                 ann_path = os.path.join(self.debug_dump_dir, f"capture_debug_annotated_{tag}_{ts}.png")
                 cv2.imwrite(ann_path, ann)
 
             print(f"[SCREEN][DUMP] saved: {raw_path}")
-            if self.debug_dump_annotated:
+            if ann_path is not None:
                 print(f"[SCREEN][DUMP] saved: {ann_path}")
 
         except Exception as e:
             print("[SCREEN][DUMP] failed:", repr(e))
 
     # ----------------------------
-    # Existing APIs (kept compatible)
+    # Existing APIs (gray 재사용 지원)
     # ----------------------------
-    def get_playfield_gray(self, img_bgr):
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    def get_playfield_gray(self, img_bgr, gray=None):
+        if gray is None:
+            gray = self.gray(img_bgr)
         h, w = gray.shape
 
         x2 = int(w * self.PLAYFIELD_RIGHT_RATIO)
@@ -270,8 +378,8 @@ class Screen:
         play = play[y1:y2, x1:x2]
         return play
 
-    def preprocess(self, img_bgr):
-        play = self.get_playfield_gray(img_bgr)
+    def preprocess(self, img_bgr, gray=None):
+        play = self.get_playfield_gray(img_bgr, gray=gray)
 
         if self.mode == "low":
             resized = cv2.resize(play, (84, 84), interpolation=cv2.INTER_AREA)
@@ -280,8 +388,9 @@ class Screen:
 
         return (resized.astype(np.float32) / 255.0)
 
-    def ui_panel_present(self, img_bgr) -> bool:
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    def ui_panel_present(self, img_bgr, gray=None) -> bool:
+        if gray is None:
+            gray = self.gray(img_bgr)
         h, w = gray.shape
         x1 = int(w * self.PLAYFIELD_RIGHT_RATIO)
         panel = gray[:, x1:]
@@ -301,8 +410,9 @@ class Screen:
         )
         return bool(ok)
 
-    def detect_death(self, img_bgr):
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    def detect_death(self, img_bgr, gray=None):
+        if gray is None:
+            gray = self.gray(img_bgr)
         h, w = gray.shape
 
         full_brightness = gray.mean() / 255.0
@@ -363,11 +473,13 @@ class Screen:
         y1 = max(0, min(H, y0 + h))
         return gray[y0:y1, x0:x1], x0, y0
 
-    def is_score_screen(self, img_bgr, thr: float = 0.75) -> bool:
+    def is_score_screen(self, img_bgr, thr: float = 0.75, gray=None) -> bool:
         if self.score_tmpl is None:
             return False
 
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        if gray is None:
+            gray = self.gray(img_bgr)
+
         src, _, _ = self._crop_roi(gray, self.score_roi)
 
         th, tw = self.score_tmpl.shape[:2]
