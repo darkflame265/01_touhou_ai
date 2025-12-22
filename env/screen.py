@@ -43,7 +43,7 @@ def _safe_mkdir(p: str):
 
 class Screen:
     # ===== playfield split =====
-    PLAYFIELD_RIGHT_RATIO = 0.70
+    PLAYFIELD_RIGHT_RATIO = 0.67
 
     PLAYFIELD_TOP_CROP = 0.00
     PLAYFIELD_BOTTOM_CROP = 1.00

@@ -99,7 +99,7 @@ class GameEnv:
         # =========================
         self.skip_dup_frames = True
         self.dup_retry = 2           # dup면 추가로 몇 번 더 캡처해볼지
-        self.dup_sleep = 0.002       # 재캡처 사이 sleep(초)
+        self.dup_sleep = 0.012       # 재캡처 사이 sleep(초)
         self.dup_reward_zero = True  # True면 dup 프레임에서 reward=0, False면 alive_reward 유지
         self.dup_thr_mean_abs = 0.05 # dup 판정 mean_abs 기준(너의 기존값)
         self.dup_sample_stride = 8   # 샘플 다운샘플 간격(너의 기존값)

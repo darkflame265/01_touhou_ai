@@ -5,7 +5,7 @@
     "w": 54,
     "h": 24
   },
-  "capture_debug_dump_on_start": false,
+  "capture_debug_dump_on_start": true,
   "capture_debug_dump_dir": "C:/01_touhou_ai/debug_caps",
   "capture_debug_dump_annotated": false
 }
