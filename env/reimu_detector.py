@@ -24,28 +24,43 @@ class ReimuDetector:
     """
 
     def __init__(
-        self,
-        screen,
-        weight_path="weights/reimu_heatmap_best.pt",
-        beta=12.0,
-        prior_strength=1.0,
-        ema_alpha=0.75,
-        device=None,
+            self,
+            screen,
+            weight_path="weights/reimu_heatmap_best.pt",
+            beta=12.0,
+            prior_strength=1.0,
 
-        # ===== tracking 옵션 =====
-        track_prior_strength=2.0,
-        track_prior_sigma=0.08,
-        lock_conf_thr=0.015,
-        max_jump_norm=0.22,
-        jump_allow_conf_gain=1.8,
-        lost_patience=8,
+            # ✅ 변경(튜닝): 더 강하게 스무딩해서 점프 억제
+            ema_alpha=0.90,
 
-        # ===== 성능 옵션 =====
-        use_fp16=True,            # CUDA에서만 의미 있음
-        track_prior_every=2,       # 1=매프레임, 2=2프레임마다, 3=3프레임마다...
-        print_prof=True,          # det 내부 프로파일 출력
-        prof_every=200,            # 몇 step마다 출력할지
-    ):
+            device=None,
+
+            # ===== tracking 옵션 =====
+
+            # ✅ 변경(튜닝): 락 주변으로 더 끌어당김(점프 억제 도움)
+            track_prior_strength=2.4,
+
+            # ✅ 변경(튜닝): prior를 더 “좁게” (락 근처 선호)
+            track_prior_sigma=0.06,
+
+            # ✅ 변경(튜닝): 애매한 conf로 락 잡지 않게
+            lock_conf_thr=0.030,
+
+            # ✅ 변경(튜닝): 한번 락 잡으면 멀리 점프 더 어렵게
+            max_jump_norm=0.14,
+
+            # ✅ 변경(튜닝): 락을 깨고 점프하려면 훨씬 높은 conf 필요
+            jump_allow_conf_gain=2.6,
+
+            # ✅ 변경(튜닝): 잠깐 흔들려도 락을 더 오래 유지
+            lost_patience=16,
+
+            # ===== 성능 옵션 =====
+            use_fp16=True,            # CUDA에서만 의미 있음
+            track_prior_every=1,       # 1=매프레임, 2=2프레임마다, 3=3프레임마다...
+            print_prof=True,          # det 내부 프로파일 출력
+            prof_every=200,            # 몇 step마다 출력할지
+        ):
         self.screen = screen
         self.weight_path = weight_path
         self.beta = float(beta)
@@ -209,32 +224,67 @@ class ReimuDetector:
     def step(self, img_bgr):
         """
         Returns:
-          None (during warmup)
-          or (x_norm, y_norm, conf, logits)
+        None (during warmup)
+        or (x_norm, y_norm, conf, logits)
+
+        ✅ 디버그 추가(원인 추적용):
+        - lock 획득/유지/해제
+        - 점프(d > max_jump_norm) 허용/거부
+        - low conf로 lock 유지/해제
+        - raw/ema/lock 좌표 및 conf, d, lost_count 출력
+
+        사용법(원하면 __init__에 넣거나 런타임에 setattr로 켜도 됨):
+        self.track_debug = True
+        self.track_debug_every = 60   # N스텝마다 정기 출력
         """
         self._step_i += 1
         t0 = time.perf_counter()
 
+        # -------------------------
+        # (DEBUG 옵션)
+        # -------------------------
+        dbg_on = bool(getattr(self, "track_debug", False))
+        dbg_every = int(getattr(self, "track_debug_every", 60))
+        if not hasattr(self, "_dbg_i"):
+            self._dbg_i = 0
+        self._dbg_i += 1
+
+        def _dbg(msg: str):
+            if not dbg_on:
+                return
+            # 너무 스팸이면 every로 제한
+            if (dbg_every > 1) and ((self._dbg_i % dbg_every) != 0):
+                return
+            print(msg)
+
+        # -------------------------
         # 1) playfield gray + resize + normalize
+        # -------------------------
         play = self.screen.get_playfield_gray(img_bgr)  # gray playfield
         small = cv2.resize(play, (self.out_w, self.out_h), interpolation=cv2.INTER_AREA)
         small = small.astype(np.float32)
         small *= (1.0 / 255.0)
         t1 = time.perf_counter()
 
+        # -------------------------
         # 2) stack buffer push
+        # -------------------------
         self._push_frame(small)
         if self._buf_len < self.stack:
             return None
         t2 = time.perf_counter()
 
+        # -------------------------
         # 3) input tensor 준비
+        # -------------------------
         x = self._make_input_tensor()
         if self.device.type == "cuda" and not self.use_fp16:
             x = x.float()
         t3 = time.perf_counter()
 
+        # -------------------------
         # 4) forward
+        # -------------------------
         with torch.inference_mode():
             logits = self.model(x)                      # (1,1,H,W)
             logits = self._apply_bottom_prior(logits)
@@ -246,7 +296,9 @@ class ReimuDetector:
             xy, conf = soft_argmax_2d(logits, beta=self.beta)
         t4 = time.perf_counter()
 
-        # 5) to python float (sync point)
+        # -------------------------
+        # 5) to python float
+        # -------------------------
         x_raw = float(xy[0, 0].item())
         y_raw = float(xy[0, 1].item())
         c = float(conf[0, 0].item())
@@ -262,46 +314,115 @@ class ReimuDetector:
 
         cur = np.array([x_n, y_n], dtype=np.float32)
 
-        # ====== lock / gating 로직 ======
+        # =========================================================
+        # lock / gating
+        # =========================================================
+        # (A) 아직 lock이 없으면: conf가 충분할 때만 lock 잡기
         if self._lock_xy is None:
             if c >= self.lock_conf_thr:
                 self._lock_xy = cur.copy()
                 self._lock_conf = c
                 self._lost_count = 0
+
+                if dbg_on:
+                    print(
+                        f"[DET][LOCK_ACQUIRE] step={self._step_i} "
+                        f"raw=({x_raw:.3f},{y_raw:.3f}) ema=({x_n:.3f},{y_n:.3f}) "
+                        f"conf={c:.4f} thr={self.lock_conf_thr:.4f}"
+                    )
+            else:
+                _dbg(
+                    f"[DET][NO_LOCK] step={self._step_i} "
+                    f"raw=({x_raw:.3f},{y_raw:.3f}) ema=({x_n:.3f},{y_n:.3f}) "
+                    f"conf={c:.4f} < thr={self.lock_conf_thr:.4f}"
+                )
             return x_n, y_n, c, logits
 
+        # (B) lock이 있는 상태
         d = self._dist(cur, self._lock_xy)
 
+        # (B1) conf가 낮으면: lost_count 증가, patience 전까지 lock 좌표로 고정
         if c < self.lock_conf_thr:
             self._lost_count += 1
+
+            if dbg_on:
+                print(
+                    f"[DET][LOW_CONF] step={self._step_i} conf={c:.4f} < thr={self.lock_conf_thr:.4f} "
+                    f"lost={self._lost_count}/{self.lost_patience} "
+                    f"d={d:.4f} lock=({float(self._lock_xy[0]):.3f},{float(self._lock_xy[1]):.3f}) "
+                    f"ema=({x_n:.3f},{y_n:.3f})"
+                )
+
             if self._lost_count >= self.lost_patience:
+                if dbg_on:
+                    print(
+                        f"[DET][LOCK_DROP_BY_LOST] step={self._step_i} "
+                        f"lost={self._lost_count}/{self.lost_patience} conf={c:.4f}"
+                    )
                 self._lock_xy = None
                 self._lock_conf = 0.0
                 self._lost_count = 0
+                return x_n, y_n, c, logits
             else:
+                # lock 유지 (반환 좌표는 lock)
                 x_n, y_n = float(self._lock_xy[0]), float(self._lock_xy[1])
-            return x_n, y_n, c, logits
+                return x_n, y_n, c, logits
 
+        # (B2) 점프 거리 초과면: 매우 높은 conf일 때만 점프 허용
         if d > self.max_jump_norm:
-            if c >= (self._lock_conf * self.jump_allow_conf_gain):
+            allow_thr = float(self._lock_conf * self.jump_allow_conf_gain)
+
+            if c >= allow_thr:
+                if dbg_on:
+                    print(
+                        f"[DET][JUMP_ACCEPT] step={self._step_i} d={d:.4f} > max_jump={self.max_jump_norm:.4f} "
+                        f"conf={c:.4f} >= allow_thr={allow_thr:.4f} "
+                        f"lock_conf={self._lock_conf:.4f} gain={self.jump_allow_conf_gain:.2f} "
+                        f"new_lock=({x_n:.3f},{y_n:.3f}) old_lock=({float(self._lock_xy[0]):.3f},{float(self._lock_xy[1]):.3f})"
+                    )
                 self._lock_xy = cur.copy()
                 self._lock_conf = c
                 self._lost_count = 0
                 return x_n, y_n, c, logits
             else:
                 self._lost_count += 1
+
+                if dbg_on:
+                    print(
+                        f"[DET][JUMP_REJECT] step={self._step_i} d={d:.4f} > max_jump={self.max_jump_norm:.4f} "
+                        f"conf={c:.4f} < allow_thr={allow_thr:.4f} "
+                        f"lost={self._lost_count}/{self.lost_patience} "
+                        f"keep_lock=({float(self._lock_xy[0]):.3f},{float(self._lock_xy[1]):.3f}) "
+                        f"ema=({x_n:.3f},{y_n:.3f}) raw=({x_raw:.3f},{y_raw:.3f})"
+                    )
+
                 if self._lost_count >= self.lost_patience:
+                    if dbg_on:
+                        print(
+                            f"[DET][LOCK_DROP_BY_JUMP] step={self._step_i} "
+                            f"lost={self._lost_count}/{self.lost_patience} conf={c:.4f}"
+                        )
                     self._lock_xy = None
                     self._lock_conf = 0.0
                     self._lost_count = 0
                     return x_n, y_n, c, logits
+
+                # lock 유지 (반환 좌표는 lock)
                 x_n, y_n = float(self._lock_xy[0]), float(self._lock_xy[1])
                 return x_n, y_n, c, logits
 
+        # (B3) 정상 범위면: lock을 부드럽게 업데이트
         a = 0.35
         self._lock_xy = (a * cur + (1.0 - a) * self._lock_xy).astype(np.float32)
         self._lock_conf = max(self._lock_conf * 0.90, c)
         self._lost_count = 0
+
+        _dbg(
+            f"[DET][LOCK_UPDATE] step={self._step_i} d={d:.4f} "
+            f"lock=({float(self._lock_xy[0]):.3f},{float(self._lock_xy[1]):.3f}) "
+            f"conf={c:.4f} lock_conf={self._lock_conf:.4f} "
+            f"ema=({x_n:.3f},{y_n:.3f}) raw=({x_raw:.3f},{y_raw:.3f})"
+        )
 
         # ===== 내부 프로파일 출력 =====
         if self.print_prof:

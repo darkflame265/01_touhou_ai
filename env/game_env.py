@@ -566,23 +566,33 @@ class GameEnv:
                 tdbg = time.perf_counter()
                 dbg = getattr(self.obs, "_dbg_last", None)
                 if dbg is not None:
-                    if len(dbg) >= 6:
+                    # dbg 포맷:
+                    # (x_use, y_use, c_use, logits, x_raw, y_raw, reason)  또는 구버전 (x, y, conf, logits ...)
+                    x_d = y_d = conf_d = None
+                    logits = None
+                    reason = ""
+
+                    if len(dbg) >= 7:
+                        x_d, y_d, conf_d, logits, x_raw, y_raw, reason = dbg[:7]
+                        xy_for_viz = (float(x_d), float(y_d))   # ✅ 게이트 통과 좌표로 표시
+                    elif len(dbg) >= 6:
                         x_d, y_d, conf_d, logits, x_raw, y_raw = dbg[:6]
-                        xy_for_viz = (x_raw, y_raw)
+                        xy_for_viz = (float(x_d), float(y_d))   # ✅ 여기서도 raw 말고 x_d,y_d
                     else:
-                        x_d, y_d, conf_d, logits = dbg
-                        xy_for_viz = (x_d, y_d)
+                        x_d, y_d, conf_d, logits = dbg[:4]
+                        xy_for_viz = (float(x_d), float(y_d))
 
                     play_dbg = self.screen.get_playfield_gray(img, gray=g)
                     self.reimu_debug.show(
                         play_gray=play_dbg,
                         heatmap_logits=logits,
                         xy_norm=xy_for_viz,
-                        conf=conf_d,
+                        conf=float(conf_d),
                         reward=reward,
                         total_reward=self.s.ep_total_reward,
                     )
                 self._prof_sum_dbg += (time.perf_counter() - tdbg)
+
 
             self.s.prev_state = state
             self.s.frame_stack.append(self.s.prev_state)
