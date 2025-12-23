@@ -36,7 +36,7 @@ class GameEnv:
         self.reward_engine = RewardEngine(self.s)
 
         # 반응속도
-        self.s.action_repeat = 2
+        self.s.action_repeat = 1
         self.s.frame_sleep = 0.012
 
         # 관측

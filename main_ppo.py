@@ -30,6 +30,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--episodes", type=int, default=1)
     p.add_argument("--no-render", action="store_true", help="disable debug/obs windows")
+    p.add_argument("--eval", action="store_true", help="evaluation mode (no training, no checkpoint, no STATS update)")
     return p.parse_args()
 
 
@@ -283,8 +284,17 @@ def _apply_no_render(env: GameEnv):
                 pass
 
 
+def _append_run_header(log_path: str, run_ts: str, episodes: int, is_eval: bool, stats: dict):
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write("\n========\n")
+        f.write(f"[RUN] {run_ts}  episodes={episodes} eval={str(bool(is_eval))}\n")
+        f.write(_stats_one_line(stats) + "\n")
+        f.write("idx\treward\tsurvival_sec\tnote\n")
+
+
 def main():
     args = parse_args()
+    is_eval = bool(args.eval)
 
     CKPT_PATH = "checkpoints/lunatic_v1.pth"
     os.makedirs(os.path.dirname(CKPT_PATH), exist_ok=True)
@@ -295,15 +305,10 @@ def main():
     stats = _ensure_stats_header(log_path)
 
     run_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write("\n========\n")
-        f.write(f"[RUN] {run_ts}  episodes={args.episodes}\n")
-        f.write(_stats_one_line(stats) + "\n")
-        f.write("idx\treward\tsurvival_sec\tnote\n")
+    _append_run_header(log_path, run_ts, int(args.episodes), is_eval, stats)
 
     print(_stats_one_line(stats))
 
-    # ✅ env 먼저 만든 뒤, input_channels 자동 계산
     env = GameEnv(screen_mode="low")
     if args.no_render:
         _apply_no_render(env)
@@ -313,7 +318,6 @@ def main():
     obs_channels = int(getattr(env.obs, "obs_channels", 1))
     stack_size = int(getattr(env.s, "frame_stack_size", 4))
     input_channels = obs_channels * stack_size
-
     print(f"[PPO] input_channels={input_channels} (obs_channels={obs_channels} * stack={stack_size})")
 
     agent = PPOAgent(
@@ -321,11 +325,12 @@ def main():
         num_actions=len(ACTIONS),
     )
 
+    # ✅ eval이면 "로드만" 권장, 그래도 파일 있으면 로드하고 없으면 그냥 진행
     if os.path.exists(CKPT_PATH):
         agent.load(CKPT_PATH, load_optimizer=False)
         print(f"[PPO] checkpoint loaded: {CKPT_PATH}")
     else:
-        print("[PPO] no checkpoint found, training from scratch")
+        print("[PPO] no checkpoint found, training from scratch" if not is_eval else "[PPO][EVAL] no checkpoint found (evaluating random policy)")
 
     print("\n[INFO] ESC 중단: Windows 전역 감지(GetAsyncKeyState)")
     print(" - 게임 창이 포커스여도 ESC를 잡고 즉시 종료합니다.\n")
@@ -351,6 +356,12 @@ def main():
 
             safe_release_inputs()
             state = env.reset()
+
+            # 디버그(원하면 지워도 됨)
+            try:
+                print("[DBG] state.shape =", state.shape, "dtype=", state.dtype, "min/max=", float(state.min()), float(state.max()))
+            except Exception:
+                pass
 
             ep_t0 = time.time()
 
@@ -379,21 +390,29 @@ def main():
 
                 next_state, reward, done = env.step(action_idx)
 
-                exec_idx = getattr(env.s, "exec_action_idx", action_idx)
-                agent.store(state, exec_idx, reward, done, log_prob, value)
+                # ✅ eval 모드면 학습 버퍼에 저장하지 않음
+                if not is_eval:
+                    exec_idx = getattr(env.s, "exec_action_idx", action_idx)
+                    agent.store(state, exec_idx, reward, done, log_prob, value)
 
                 state = next_state
                 total_reward += reward
                 steps += 1
 
-                if agent.should_update():
+                # ✅ eval 모드면 update 자체를 하지 않음
+                if (not is_eval) and agent.should_update():
                     agent.update(last_state=state, last_done=done)
 
             survival_sec = time.time() - ep_t0
             slow_ratio = slow_count / max(1, steps)
             top_actions = action_counter.most_common(5)
             top_actions_str = ";".join(f"{k}:{v}" for k, v in top_actions)
-            note = "ABORTED" if aborted else ""
+            note_parts = []
+            if is_eval:
+                note_parts.append("EVAL")
+            if aborted:
+                note_parts.append("ABORTED")
+            note = ",".join(note_parts)
 
             print(
                 f"[PPO] episode end | steps={steps} total_reward={total_reward:.1f} "
@@ -401,26 +420,33 @@ def main():
                 f"top_actions={top_actions_str} {note}"
             )
 
+            # ✅ (중요) eval이어도 에피소드 결과 라인은 항상 로그에 남긴다
             ep_tag = f"({ep}/{args.episodes})"
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"{ep_tag}\t{total_reward:.6f}\t{survival_sec:.3f}\t{note}\n")
 
+            # ✅ eval이면 STATS/체크포인트 갱신은 절대 안 함
             if aborted:
-                _try_clear_agent_rollout(agent)
-                print("[STOP] Episode aborted -> skip final update & checkpoint save.")
+                if not is_eval:
+                    _try_clear_agent_rollout(agent)
+                print("[STOP] Episode aborted -> stopping.")
                 break
 
-            _maybe_update_records(stats, total_reward, survival_sec, run_ts, ep_tag)
-            _update_stats_in_file(log_path, stats)
-            print(_stats_one_line(stats))
+            if not is_eval:
+                _maybe_update_records(stats, total_reward, survival_sec, run_ts, ep_tag)
+                _update_stats_in_file(log_path, stats)
+                print(_stats_one_line(stats))
 
-            agent.update(last_state=state, last_done=True)
+                agent.update(last_state=state, last_done=True)
 
-            ok = _safe_save_checkpoint(agent, CKPT_PATH)
-            if ok:
-                print("[PPO] checkpoint saved")
+                ok = _safe_save_checkpoint(agent, CKPT_PATH)
+                if ok:
+                    print("[PPO] checkpoint saved")
+                else:
+                    print("[WARN] checkpoint save failed -> continue training without stopping")
             else:
-                print("[WARN] checkpoint save failed -> continue training without stopping")
+                # eval은 stats 고정 출력(변화 없음)
+                print(_stats_one_line(stats))
 
             if stop_requested:
                 print("[STOP] Training stopped by ESC. Exiting main_ppo.py.")
