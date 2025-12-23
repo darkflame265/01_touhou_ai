@@ -433,6 +433,6 @@ class ReimuDetector:
                 ms_in = (t3 - t2) * 1000.0
                 ms_fw = (t4 - t3) * 1000.0
                 ms_all = (t4 - t0) * 1000.0
-                print(f"[DET_PROF] pre={ms_pre:.2f} buf={ms_buf:.2f} in={ms_in:.2f} fw={ms_fw:.2f} total={ms_all:.2f}")
+                #print(f"[DET_PROF] pre={ms_pre:.2f} buf={ms_buf:.2f} in={ms_in:.2f} fw={ms_fw:.2f} total={ms_all:.2f}")
 
         return float(self._lock_xy[0]), float(self._lock_xy[1]), c, logits

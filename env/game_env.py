@@ -590,6 +590,7 @@ class GameEnv:
                         conf=float(conf_d),
                         reward=reward,
                         total_reward=self.s.ep_total_reward,
+                        crop_size=int(getattr(self.obs, "crop_size", 0)) or None,   # ✅ 추가
                     )
                 self._prof_sum_dbg += (time.perf_counter() - tdbg)
 

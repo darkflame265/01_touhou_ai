@@ -7,20 +7,29 @@ from env.reimu_detector import ReimuDetector
 
 
 class ObsBuilder:
-    def __init__(self, screen, debug_viz=None, obs_out_size=84, crop_size=160, use_fallback_full_preprocess=True):
+    def __init__(
+        self,
+        screen,
+        debug_viz=None,
+        obs_out_size=84,
+        crop_size=160,
+        use_fallback_full_preprocess=True,
+        # 디버그(탄막 강조) 옵션
+        debug_bullets=True,
+    ):
         self.screen = screen
         self.debug = debug_viz
 
         self.obs_out_size = int(obs_out_size)
         self.crop_size = int(crop_size)
         self.use_fallback_full_preprocess = bool(use_fallback_full_preprocess)
+        self.debug_bullets = bool(debug_bullets)
 
         img0 = self.screen.capture()
         h0, w0 = img0.shape[:2]
         self.H, self.W = h0, w0
 
         # ✅ 레이무 검출기(히트맵)
-        # - 여기 파라미터는 "reimu_detector.py"에서 네가 원하는 수치로 맞춘 버전을 쓴다고 가정
         self.det = ReimuDetector(
             screen=self.screen,
             weight_path="weights/reimu_heatmap_best.pt",
@@ -29,7 +38,7 @@ class ObsBuilder:
             ema_alpha=0.85,
             device=None,
 
-            # tracking 옵션 (ReimuDetector 내부 lock 사용)
+            # tracking 옵션
             track_prior_strength=2.0,
             track_prior_sigma=0.08,
             lock_conf_thr=0.015,
@@ -52,24 +61,21 @@ class ObsBuilder:
         self.conf_update_thr = 0.02
 
         # -------------------------
-        # ✅ (NEW) ObsBuilder 추가 점프 억제 게이트
+        # ✅ ObsBuilder 추가 점프 억제 게이트
         # -------------------------
-        # detector lock이 있어도 "잠깐 더 강한 물체"로 튀는 경우가 있어서,
-        # crop 중심을 옮길지 말지를 ObsBuilder에서 한 번 더 필터링한다.
-        self.max_jump_norm_obs = 0.18          # 이보다 멀리 튀면 "점프"로 간주 (playfield norm)
-        self.jump_allow_conf_gain_obs = 2.0    # 점프 허용하려면 conf가 이전 대비 이만큼 좋아야 함
-        self.lost_patience_obs = 10            # 낮은 conf/거절 누적이 이만큼이면 강제로 새 위치를 허용(락 풀림 비슷하게)
+        self.max_jump_norm_obs = 0.18
+        self.jump_allow_conf_gain_obs = 2.0
+        self.lost_patience_obs = 10
         self._lost_obs = 0
 
-        # 디버그용 (GameEnv에서 사용)
+        # 디버그용(외부에서 읽을 수 있게)
         self._dbg_last = None
 
-        # ✅ 정책 입력(관측 이미지)에 박아 넣을 좌표/신뢰도 캐시
-        # - 여기 값이 reward shaping에도 쓰이니까 "게이트 통과한 값"으로 유지하는 게 안정적임
+        # 정책 입력(관측 이미지)에 박아 넣을 좌표/신뢰도 캐시
         self.last_xy_norm = (0.5, 0.78)  # playfield norm 0..1
         self.last_conf = 0.0
 
-        # ✅ 메타 픽셀 설정 (CNN이 잘 읽게 4x4)
+        # 메타 픽셀 설정 (CNN이 잘 읽게 4x4)
         self.meta_patch = 4
 
         # -------------------------
@@ -84,6 +90,7 @@ class ObsBuilder:
         self._t_gray_resize = 0.0
         self._t_meta = 0.0
         self._t_fallback = 0.0
+        self._t_dbg = 0.0
 
         # playfield width 캐시
         self._playfield_ratio = float(getattr(self.screen, "PLAYFIELD_RIGHT_RATIO", 0.70))
@@ -106,7 +113,16 @@ class ObsBuilder:
         self._t_gray_resize = 0.0
         self._t_meta = 0.0
         self._t_fallback = 0.0
+        self._t_dbg = 0.0
 
+    def on_player_death(self):
+        if hasattr(self.det, "on_player_death"):
+            self.det.on_player_death()
+        self._lost_obs = 0
+
+    # -------------------------
+    # utils
+    # -------------------------
     def _crop_square_bgr(self, img_bgr, cx, cy, size):
         """
         ✅ fast-path:
@@ -151,10 +167,11 @@ class ObsBuilder:
         cy = int(np.clip(y_n * self.H, 0, self.H - 1))
         return cx, cy
 
-    def on_player_death(self):
-        if hasattr(self.det, "on_player_death"):
-            self.det.on_player_death()
-        self._lost_obs = 0
+    @staticmethod
+    def _dist_norm(a_xy, b_xy) -> float:
+        dx = float(a_xy[0] - b_xy[0])
+        dy = float(a_xy[1] - b_xy[1])
+        return float((dx * dx + dy * dy) ** 0.5)
 
     def _inject_meta_pixels(self, obs01: np.ndarray) -> np.ndarray:
         t0 = time.perf_counter()
@@ -191,24 +208,19 @@ class ObsBuilder:
         gray_ms = (self._t_gray_resize / n) * 1000.0
         meta_ms = (self._t_meta / n) * 1000.0
         fb_ms = (self._t_fallback / n) * 1000.0
+        dbg_ms = (self._t_dbg / n) * 1000.0
 
-        print(
-            f"[OBS_PROF] avg_ms/step | det={det_ms:.2f} crop={crop_ms:.2f} "
-            f"gray+resize={gray_ms:.2f} meta={meta_ms:.2f} fallback={fb_ms:.2f}"
-        )
-
-    @staticmethod
-    def _dist_norm(a_xy, b_xy) -> float:
-        dx = float(a_xy[0] - b_xy[0])
-        dy = float(a_xy[1] - b_xy[1])
-        return float((dx * dx + dy * dy) ** 0.5)
+        # print(
+        #     f"[OBS_PROF] avg_ms/step | det={det_ms:.2f} crop={crop_ms:.2f} "
+        #     f"gray+resize={gray_ms:.2f} meta={meta_ms:.2f} fallback={fb_ms:.2f} dbg={dbg_ms:.2f}"
+        # )
 
     def _gate_xy_update(self, x_n, y_n, conf):
         """
-        ✅ (NEW) detector가 주는 (x,y)가 순간적으로 튀는 문제를 ObsBuilder에서 한 번 더 방지.
+        ✅ detector가 주는 (x,y)가 순간적으로 튀는 문제를 ObsBuilder에서 한 번 더 방지.
         - conf가 낮으면: 이전 last_xy_norm 유지
         - conf가 충분해도 "점프"면: conf가 이전 대비 충분히 좋아질 때만 점프 허용
-        - 낮은 conf/거절이 너무 오래 지속되면: 강제로 새 값 허용(영원히 고정되는 문제 방지)
+        - 낮은 conf/거절이 너무 오래 지속되면: 강제로 새 값 허용
         """
         prev_xy = self.last_xy_norm
         prev_c = float(self.last_conf)
@@ -221,7 +233,6 @@ class ObsBuilder:
         if conf < float(self.conf_update_thr):
             self._lost_obs += 1
             if self._lost_obs >= int(self.lost_patience_obs):
-                # 너무 오래 못 찾으면 그냥 받아들여서 다시 따라가게 함
                 self._lost_obs = 0
                 return (x_n, y_n, conf, True, "FORCE_LOWCONF")
             return (float(prev_xy[0]), float(prev_xy[1]), float(prev_c), False, "LOWCONF_HOLD")
@@ -229,7 +240,6 @@ class ObsBuilder:
         # 2) 점프 검사
         d = self._dist_norm((x_n, y_n), prev_xy)
         if d > float(self.max_jump_norm_obs):
-            # 점프를 허용하려면 conf가 "이전 대비" 확실히 좋아야 함
             need = max(1e-6, prev_c) * float(self.jump_allow_conf_gain_obs)
             if conf >= need:
                 self._lost_obs = 0
@@ -245,6 +255,67 @@ class ObsBuilder:
         self._lost_obs = 0
         return (x_n, y_n, conf, True, "OK")
 
+    # -------------------------
+    # ✅ Debug: 탄막 강조 맵 만들기 (학습 입력은 건드리지 않음)
+    # -------------------------
+    def _make_bullet_emphasis(self, crop_gray_01: np.ndarray) -> np.ndarray:
+        """
+        crop_gray_01: float32 0..1 (obs_out_size x obs_out_size)
+        반환: float32 0..1 (탄막/작은 밝은 점 위주로 강조)
+        """
+        g8 = np.clip(crop_gray_01 * 255.0, 0, 255).astype(np.uint8)
+
+        # 작은 밝은 점(탄막)을 강조하기 위한 blackhat
+        # 커널은 너무 크면 글로우/배경까지 먹으니 5~9 사이 추천
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        bh = cv2.morphologyEx(g8, cv2.MORPH_BLACKHAT, k)
+
+        # 약간의 대비 확장
+        bh = cv2.GaussianBlur(bh, (3, 3), 0)
+
+        # 정규화 -> 0..1
+        bh_f = bh.astype(np.float32)
+        mx = float(bh_f.max()) if bh_f.size else 0.0
+        if mx > 1e-6:
+            bh_f = bh_f / mx
+        else:
+            bh_f[:] = 0.0
+        return bh_f
+
+    def _maybe_debug_show(self, crop_bgr, obs01, bullet01=None):
+        """
+        debug_viz가 특정 메서드를 갖고 있으면 호출하는 방식(프로젝트 호환성 유지).
+        - DebugViz / ReimuDebugViz 어떤 걸 쓰든 에러 없이 넘어가게 try/hasattr 처리.
+        """
+        if self.debug is None:
+            return
+        t0 = time.perf_counter()
+        try:
+            # 1) raw crop 보여주기(가능하면)
+            if hasattr(self.debug, "show_obs_crop"):
+                # show_obs_crop(crop_bgr, obs01, bullet01)
+                try:
+                    self.debug.show_obs_crop(crop_bgr, obs01, bullet01)
+                except TypeError:
+                    # 시그니처가 다르면 최소한 crop만
+                    self.debug.show_obs_crop(crop_bgr)
+            elif hasattr(self.debug, "show_crop"):
+                self.debug.show_crop(crop_bgr)
+
+            # 2) obs / bullet 맵 따로
+            if hasattr(self.debug, "show_obs"):
+                self.debug.show_obs(obs01)
+            if bullet01 is not None and hasattr(self.debug, "show_bullets"):
+                self.debug.show_bullets(bullet01)
+        except Exception:
+            pass
+        finally:
+            if self.prof_enabled:
+                self._t_dbg += (time.perf_counter() - t0)
+
+    # -------------------------
+    # main
+    # -------------------------
     def make_state(self, img_bgr):
         # -------------------------
         # 1) detector
@@ -254,15 +325,19 @@ class ObsBuilder:
         if self.prof_enabled:
             self._t_det += (time.perf_counter() - t0)
 
+        used_conf = 0.0  # ✅ 게이트 통과 conf(=정책/판단에 쓸 값)
+
         if det is None:
             cx, cy = self.player_center
-            conf = 0.0
             self._dbg_last = None
+            # last_xy_norm/last_conf는 유지 (이전 값 기반으로 계속 crop)
+            used_conf = float(self.last_conf)
         else:
-            x_n, y_n, conf, logits = det
+            x_n, y_n, conf_raw, logits = det
 
             # ✅ ObsBuilder 게이트(점프 억제/저신뢰 홀드)
-            x_use, y_use, c_use, used, reason = self._gate_xy_update(x_n, y_n, conf)
+            x_use, y_use, c_use, used, reason = self._gate_xy_update(x_n, y_n, conf_raw)
+            used_conf = float(c_use)
 
             # 정책 입력/리워드 shaping 안정화를 위해 "게이트 통과값"을 저장
             self.last_xy_norm = (float(x_use), float(y_use))
@@ -277,7 +352,7 @@ class ObsBuilder:
             else:
                 cx, cy = self.player_center
 
-            # raw 좌표는 디버그용으로만 유지
+            # raw 좌표는 디버그용
             x_raw, y_raw = float(x_n), float(y_n)
             try:
                 if hasattr(self.det, "last_raw_xy") and (self.det.last_raw_xy is not None):
@@ -289,12 +364,12 @@ class ObsBuilder:
             self._dbg_last = (float(x_use), float(y_use), float(c_use), logits, float(x_raw), float(y_raw), str(reason))
 
         # -------------------------
-        # 2) fallback
+        # 2) fallback (✅ raw conf가 아니라 used_conf 기준!)
         # -------------------------
-        if self.use_fallback_full_preprocess and ((det is None) or (float(conf) <= 1e-6)):
+        if self.use_fallback_full_preprocess and (det is None or used_conf <= 1e-6):
             t0 = time.perf_counter()
 
-            full = self.screen.preprocess(img_bgr)  # float32 0..1
+            full = self.screen.preprocess(img_bgr)  # float32 0..1 (보통 84x84)
             if full.shape != (self.obs_out_size, self.obs_out_size):
                 full = cv2.resize(full, (self.obs_out_size, self.obs_out_size), interpolation=cv2.INTER_AREA)
             if full.dtype != np.float32:
@@ -305,6 +380,10 @@ class ObsBuilder:
             if self.prof_enabled:
                 self._t_fallback += (time.perf_counter() - t0)
                 self._prof_print_if_needed()
+
+            # 디버그 표시(가능하면)
+            # fallback은 crop_bgr가 없으니 obs만
+            self._maybe_debug_show(crop_bgr=None, obs01=full, bullet01=None)
             return full
 
         # -------------------------
@@ -316,19 +395,31 @@ class ObsBuilder:
             self._t_crop += (time.perf_counter() - t0)
 
         # -------------------------
-        # 4) gray + resize
+        # 4) gray + resize -> obs01
         # -------------------------
         t0 = time.perf_counter()
         crop_gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
         interp = cv2.INTER_AREA if self.crop_size >= self.obs_out_size else cv2.INTER_LINEAR
         obs = cv2.resize(crop_gray, (self.obs_out_size, self.obs_out_size), interpolation=interp)
-        obs = obs.astype(np.float32) / 255.0
+        obs01 = obs.astype(np.float32) / 255.0
         if self.prof_enabled:
             self._t_gray_resize += (time.perf_counter() - t0)
 
         # 5) meta
-        obs = self._inject_meta_pixels(obs)
+        obs01 = self._inject_meta_pixels(obs01)
+
+        # -------------------------
+        # 6) debug: 탄막 강조 맵(선택)
+        # -------------------------
+        bullet01 = None
+        if self.debug_bullets:
+            try:
+                bullet01 = self._make_bullet_emphasis(obs01)
+            except Exception:
+                bullet01 = None
+
+        self._maybe_debug_show(crop_bgr=crop_bgr, obs01=obs01, bullet01=bullet01)
 
         if self.prof_enabled:
             self._prof_print_if_needed()
-        return obs
+        return obs01
