@@ -15,9 +15,8 @@ class MaskingConfig:
     use_flip: bool = True
 
     # 상단 제한(원하면 켜기)
-    # None이면 기능 꺼짐
     top_limit_px: Optional[int] = None
-    top_limit_fudge_px: int = 10  # 너 코드에 있던 -10 여유
+    top_limit_fudge_px: int = 10
 
 
 class ActionMasker:
@@ -26,12 +25,15 @@ class ActionMasker:
         self.obs = obs
         self.cfg = cfg
 
-    def _action_dir(self, action_enum) -> Tuple[int, int, bool]:
+    def _action_dir(self, action_enum) -> Tuple[int, int]:
+        """
+        actions.py가 'SLOW_...' 이름을 쓰더라도 value는 ["LEFT"], ["UP","RIGHT"] 같이
+        방향키만 들어있다고 가정.
+        """
         keys = set(action_enum.value)
         dx = (-1 if "LEFT" in keys else (1 if "RIGHT" in keys else 0))
         dy = (-1 if "UP" in keys else (1 if "DOWN" in keys else 0))
-        is_slow = ("SLOW" in keys)
-        return dx, dy, is_slow
+        return dx, dy
 
     def _flip_action(self, action_enum, flip_x: bool = False, flip_y: bool = False):
         keys = list(action_enum.value)
@@ -81,9 +83,10 @@ class ActionMasker:
             top_forbid = (py <= top_line)
 
         for i, a in enumerate(ACTIONS):
-            dx, dy, _ = self._action_dir(a)
             if a.name == "NONE":
                 continue
+
+            dx, dy = self._action_dir(a)
 
             if near_left and dx < 0:
                 mask[i] = False
@@ -122,7 +125,7 @@ class ActionMasker:
             top_d = py - t
             bot_d = b - py
 
-            dx, dy, _ = self._action_dir(orig)
+            dx, dy = self._action_dir(orig)
 
             if (left_d <= margin_px and dx < 0) or (right_d <= margin_px and dx > 0):
                 flip_x = True
@@ -149,7 +152,7 @@ class ActionMasker:
 
         # 마지막 보정: UP 계열이면 DOWN 계열 강제 시도
         if pc is not None:
-            dx, dy, _ = self._action_dir(orig)
+            dx, dy = self._action_dir(orig)
             if dy < 0:
                 forced = self._flip_action(orig, flip_y=True)
                 try:

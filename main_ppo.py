@@ -59,11 +59,6 @@ def boot_print_state(env):
 
 
 def ensure_practice_ready_for_episode(env: GameEnv, ep: int) -> bool:
-    """
-    에피소드 시작 전:
-      - 어떤 화면이든 '로비 확보 -> practice 진입'만 확실히 한다.
-      - 상세 상태 분기(옵션/난이도/인게임 등)는 전부 OTHER로 보고 X 연타 복귀.
-    """
     print(f"[EP_PREP] boot_into_practice (ep={ep})")
     ok = boot_into_practice(env.screen, max_sec_lobby=12.0)
     if not ok:
@@ -95,7 +90,7 @@ def _safe_save_checkpoint(agent, ckpt_path: str) -> bool:
 
 
 # =========================================================
-# ✅ 누적 최고기록(STATS) 관리 (원본 유지)
+# ✅ 누적 최고기록(STATS) 관리
 # =========================================================
 STATS_BEGIN = "# === PPO_STATS_BEGIN ==="
 STATS_END = "# === PPO_STATS_END ==="
@@ -259,11 +254,20 @@ def _stats_one_line(stats: dict) -> str:
 
 
 def _apply_no_render(env: GameEnv):
+    # reimu heatmap/debug 창
     try:
         env.show_reimu_debug = False
     except Exception:
         pass
 
+    # ObsBuilder crop 디버그 창
+    try:
+        if hasattr(env, "obs") and hasattr(env.obs, "show_obs_debug"):
+            env.obs.show_obs_debug = False
+    except Exception:
+        pass
+
+    # (구 DebugViz가 남아있으면 끄기)
     dbg = getattr(env, "debug", None)
     if dbg is not None:
         for name, val in (
@@ -299,14 +303,21 @@ def main():
 
     print(_stats_one_line(stats))
 
+    # ✅ env 먼저 만든 뒤, input_channels 자동 계산
     env = GameEnv(screen_mode="low")
     if args.no_render:
         _apply_no_render(env)
 
     boot_print_state(env)
 
+    obs_channels = int(getattr(env.obs, "obs_channels", 1))
+    stack_size = int(getattr(env.s, "frame_stack_size", 4))
+    input_channels = obs_channels * stack_size
+
+    print(f"[PPO] input_channels={input_channels} (obs_channels={obs_channels} * stack={stack_size})")
+
     agent = PPOAgent(
-        input_channels=4,
+        input_channels=input_channels,
         num_actions=len(ACTIONS),
     )
 
@@ -338,7 +349,7 @@ def main():
             ensure_practice_ready_for_episode(env, ep)
             print("[MENU] [practice 준비/진입 완료]")
 
-            safe_release_inputs()  # 에피소드 시작 전 입력 잔상 제거
+            safe_release_inputs()
             state = env.reset()
 
             ep_t0 = time.time()

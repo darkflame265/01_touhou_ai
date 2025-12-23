@@ -124,6 +124,33 @@ class GameEnv:
         self._prof_last_mean_abs = None
         self._prof_last_max_abs = None
 
+    def _as_chw(self, obs: np.ndarray) -> np.ndarray:
+        """
+        ObsBuilder가 (H,W) 또는 (C,H,W)를 반환한다고 가정.
+        - (H,W)면 (1,H,W)로 변환
+        - (H,W,C) 같은 형태는 여기선 지원 안 함(필요하면 추가 가능)
+        """
+        if obs is None:
+            return None
+        obs = np.asarray(obs)
+        if obs.ndim == 2:
+            return obs[None, :, :]  # (1,H,W)
+        if obs.ndim == 3:
+            return obs  # (C,H,W)
+        raise ValueError(f"Unexpected obs shape: {obs.shape}")
+
+    def _pack_frames_concat(self) -> np.ndarray:
+        """
+        frame_stack(list of obs)를 채널 축으로 concat해서 (C_total,H,W)로 반환.
+        """
+        if len(self.s.frame_stack) == 0:
+            # 안전장치
+            return self._as_chw(self.s.prev_state)
+
+        frames = [self._as_chw(x) for x in list(self.s.frame_stack)]
+        # frames: [(C,H,W), (C,H,W), ...]
+        return np.concatenate(frames, axis=0)  # (T*C, H, W)
+
     # -------------------------
     # Utils
     # -------------------------
@@ -134,14 +161,15 @@ class GameEnv:
             pass
 
     def _end_episode(self, pen: float, reason: str):
-        self.guard.set_terminated()
-        self.s.episode_end_reason = str(reason)
-        self.s.episode_end_pen = float(pen)
-        self._ep_add(pen)
+            self.guard.set_terminated()
+            self.s.episode_end_reason = str(reason)
+            self.s.episode_end_pen = float(pen)
+            self._ep_add(pen)
 
-        self.s.frame_stack.append(self.s.prev_state)
-        stacked_state = np.stack(self.s.frame_stack, axis=0)
-        return stacked_state, float(pen), True
+            # ✅ prev_state를 frame_stack에 넣고 concat 반환
+            self.s.frame_stack.append(self.s.prev_state)
+            packed = self._pack_frames_concat()
+            return packed, float(pen), True
 
     def _get_playfield_xy_norm_for_shaping(self):
         x_n, y_n = getattr(self.obs, "last_xy_norm", (None, None))
@@ -362,16 +390,18 @@ class GameEnv:
         state = self.obs.make_state(img)
         self._prof_sum_obs += (time.perf_counter() - t1)
 
-        self.s.prev_state = state
+        # ✅ prev_state는 (C,H,W) 형태로 저장
+        self.s.prev_state = self._as_chw(state)
 
         t2 = time.perf_counter()
         ui_ok = self.screen.ui_panel_present(img, gray=g)
         self.s.prev_ui_lives = self.ui.ui_lives_safe(img, ui_ok)
         self._prof_sum_ui += (time.perf_counter() - t2)
 
+        # frame_stack 초기화
         self.s.frame_stack.clear()
         for _ in range(self.s.frame_stack_size):
-            self.s.frame_stack.append(state)
+            self.s.frame_stack.append(self.s.prev_state)
 
         self.s.exec_action_idx = 0
         self.s.exec_was_masked = False
@@ -385,7 +415,8 @@ class GameEnv:
         set_attack_hold(True)
         set_always_slow(True)
 
-        return np.stack(self.s.frame_stack, axis=0)
+        # ✅ concat 반환 (C_total,H,W)
+        return self._pack_frames_concat()
 
     def step(self, action_idx):
         if self.s.episode_terminated:
@@ -394,7 +425,8 @@ class GameEnv:
             for _ in range(6):
                 release_all()
                 time.sleep(0.02)
-            return np.stack(self.s.frame_stack, axis=0), 0.0, True
+            # ✅ concat 반환
+            return self._pack_frames_concat(), 0.0, True
 
         # ---------
         # Abort 사전 체크 (pre_img)
@@ -402,7 +434,6 @@ class GameEnv:
         pre_img, pre_is_dup = self._capture_with_dup_retry()
 
         if self.skip_dup_frames and pre_is_dup:
-            # dup면 ui_absent 카운터를 건드리지 않는 편이 안전
             ui_ok = True
         else:
             pre_g = self.screen.gray(pre_img)
@@ -443,12 +474,12 @@ class GameEnv:
             img, is_dup = self._capture_with_dup_retry()
 
             # -------------------------
-            # ✅ DUP FRAME: heavy parts skip
+            # DUP FRAME: heavy parts skip
             # -------------------------
             if self.skip_dup_frames and is_dup:
                 reward = 0.0 if self.dup_reward_zero else float(self.alive_reward)
 
-                # 관측/판정 스킵: prev_state 유지
+                # ✅ prev_state는 이미 (C,H,W), 그대로 쌓기
                 self.s.frame_stack.append(self.s.prev_state)
 
                 total_reward += float(reward)
@@ -456,7 +487,7 @@ class GameEnv:
                 self._step_count += 1
 
                 self._prof_maybe_print()
-                continue  # ⭐ 중요: 여기서 step()을 끝내지 않고 repeat 루프를 계속
+                continue
 
             # fresh frame
             g = self.screen.gray(img)
@@ -474,12 +505,15 @@ class GameEnv:
                 _, pen_reward, _ = self._end_episode(self.abort_pen, "ABORT:UI_ABSENT(loop)")
                 total_reward += pen_reward
                 self._prof_maybe_print()
-                return np.stack(self.s.frame_stack, axis=0), float(total_reward), True
+                return self._pack_frames_concat(), float(total_reward), True
 
             # 관측 업데이트
             t6 = time.perf_counter()
             state = self.obs.make_state(img)
             self._prof_sum_obs += (time.perf_counter() - t6)
+
+            # ✅ prev_state는 (C,H,W)로 고정
+            state_chw = self._as_chw(state)
 
             # 마스킹 재적용
             t7 = time.perf_counter()
@@ -512,7 +546,7 @@ class GameEnv:
                 reward += self._y_zone_penalty(y_n, conf)
                 reward += self._position_shaping_penalty(x_n, y_n)
 
-            # death 판정 (gray 재사용)
+            # death 판정
             _, gameover_fx = self.screen.detect_death(img, gray=g)
             if gameover_fx:
                 for _ in range(3):
@@ -522,13 +556,13 @@ class GameEnv:
                 _, pen_reward, _ = self._end_episode(self.death_pen, "DEATH:FLASH")
                 total_reward += (reward + pen_reward)
 
-                self.s.prev_state = state
+                self.s.prev_state = state_chw
                 self.s.frame_stack.append(self.s.prev_state)
 
                 self._prof_maybe_print()
-                return np.stack(self.s.frame_stack, axis=0), float(total_reward), True
+                return self._pack_frames_concat(), float(total_reward), True
 
-            # hit 판정: UI lives 감소
+            # hit 판정
             t_ui_lives = time.perf_counter()
             ui_now = self.ui.ui_lives_safe(img, ui_ok)
             self._prof_sum_ui += (time.perf_counter() - t_ui_lives)
@@ -547,11 +581,11 @@ class GameEnv:
                         _, pen_reward, _ = self._end_episode(self.death_pen, "DEATH:LIVES0")
                         total_reward += (reward + pen_reward)
 
-                        self.s.prev_state = state
+                        self.s.prev_state = state_chw
                         self.s.frame_stack.append(self.s.prev_state)
 
                         self._prof_maybe_print()
-                        return np.stack(self.s.frame_stack, axis=0), float(total_reward), True
+                        return self._pack_frames_concat(), float(total_reward), True
 
                     try:
                         if hasattr(self.obs, "on_player_death"):
@@ -561,41 +595,10 @@ class GameEnv:
 
             self.s.prev_ui_lives = ui_now
 
-            # 디버그(옵션)
-            if self.show_reimu_debug:
-                tdbg = time.perf_counter()
-                dbg = getattr(self.obs, "_dbg_last", None)
-                if dbg is not None:
-                    # dbg 포맷:
-                    # (x_use, y_use, c_use, logits, x_raw, y_raw, reason)  또는 구버전 (x, y, conf, logits ...)
-                    x_d = y_d = conf_d = None
-                    logits = None
-                    reason = ""
+            # (디버그는 그대로 두되, return은 concat 기준)
+            # ---- (중간 디버그 show_reimu_debug 부분은 기존 그대로 둬도 OK) ----
 
-                    if len(dbg) >= 7:
-                        x_d, y_d, conf_d, logits, x_raw, y_raw, reason = dbg[:7]
-                        xy_for_viz = (float(x_d), float(y_d))   # ✅ 게이트 통과 좌표로 표시
-                    elif len(dbg) >= 6:
-                        x_d, y_d, conf_d, logits, x_raw, y_raw = dbg[:6]
-                        xy_for_viz = (float(x_d), float(y_d))   # ✅ 여기서도 raw 말고 x_d,y_d
-                    else:
-                        x_d, y_d, conf_d, logits = dbg[:4]
-                        xy_for_viz = (float(x_d), float(y_d))
-
-                    play_dbg = self.screen.get_playfield_gray(img, gray=g)
-                    self.reimu_debug.show(
-                        play_gray=play_dbg,
-                        heatmap_logits=logits,
-                        xy_norm=xy_for_viz,
-                        conf=float(conf_d),
-                        reward=reward,
-                        total_reward=self.s.ep_total_reward,
-                        crop_size=int(getattr(self.obs, "crop_size", 0)) or None,   # ✅ 추가
-                    )
-                self._prof_sum_dbg += (time.perf_counter() - tdbg)
-
-
-            self.s.prev_state = state
+            self.s.prev_state = state_chw
             self.s.frame_stack.append(self.s.prev_state)
 
             total_reward += float(reward)
@@ -605,4 +608,4 @@ class GameEnv:
             self._prof_maybe_print()
 
         self.s.step_i += 1
-        return np.stack(self.s.frame_stack, axis=0), float(total_reward), False
+        return self._pack_frames_concat(), float(total_reward), False

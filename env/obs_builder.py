@@ -1,5 +1,4 @@
 # env/obs_builder.py
-import time
 import cv2
 import numpy as np
 
@@ -7,6 +6,16 @@ from env.reimu_detector import ReimuDetector
 
 
 class ObsBuilder:
+    """
+    ✅ 2채널 관측
+      - ch0: 현재 crop_gray (0..1)
+      - ch1: absdiff(current_crop_gray, prev_crop_gray) (0..1)
+
+    ✅ 리턴 shape: (2, obs_out_size, obs_out_size)  float32
+
+    ✅ 디버그: crop 원본(gray, crop_size x crop_size) 창 1개만 표시
+    """
+
     def __init__(self, screen, debug_viz=None, obs_out_size=84, crop_size=160, use_fallback_full_preprocess=True):
         self.screen = screen
         self.debug = debug_viz
@@ -15,11 +24,14 @@ class ObsBuilder:
         self.crop_size = int(crop_size)
         self.use_fallback_full_preprocess = bool(use_fallback_full_preprocess)
 
+        # ✅ 외부에서 채널 수를 알 수 있게
+        self.obs_channels = 2
+
         img0 = self.screen.capture()
         h0, w0 = img0.shape[:2]
         self.H, self.W = h0, w0
 
-        # ✅ 레이무 검출기
+        # ✅ 레이무 검출기(히트맵)
         self.det = ReimuDetector(
             screen=self.screen,
             weight_path="weights/reimu_heatmap_best.pt",
@@ -28,6 +40,7 @@ class ObsBuilder:
             ema_alpha=0.85,
             device=None,
 
+            # tracking 옵션
             track_prior_strength=2.0,
             track_prior_sigma=0.08,
             lock_conf_thr=0.015,
@@ -35,18 +48,17 @@ class ObsBuilder:
             jump_allow_conf_gain=1.8,
             lost_patience=8,
 
+            # 성능 옵션
             use_fp16=True,
             track_prior_every=2,
             print_prof=True,
             prof_every=200,
         )
 
-        # player center (fallback 기준)
         self.player_center = (w0 // 2, int(h0 * 0.78))
-        self._last_conf = 0.0
         self.conf_update_thr = 0.02
 
-        # 게이트
+        # 점프 억제 게이트
         self.max_jump_norm_obs = 0.18
         self.jump_allow_conf_gain_obs = 2.0
         self.lost_patience_obs = 10
@@ -54,52 +66,37 @@ class ObsBuilder:
 
         # 디버그용
         self._dbg_last = None
+
+        # 정책/리워드용 좌표/신뢰도
         self.last_xy_norm = (0.5, 0.78)
         self.last_conf = 0.0
+
+        # ✅ 메타 픽셀 설정 (ch0에만)
         self.meta_patch = 4
-
-        # -------------------------
-        # ✅ (CHANGED) crop 디버그 창: 1개만
-        # -------------------------
-        self.show_obs_debug = False
-        self.win_crop = "OBS_CROP"
-
-        # 창 위치(더 오른쪽으로)
-        # - 모니터 해상도에 따라 더 키워도 됨
-        self.win_x = 1650
-        self.win_y = 60
-
-        # 보기 좋은 표시 크기(윈도우 크기)
-        # - 실제 데이터는 crop_size지만, 화면에 크게 보여주기 위해 resizeWindow만 키움
-        self.win_w = 520
-        self.win_h = 520
-
-        self._crop_win_inited = False
-
-        # 디버그 캐시
-        self.last_crop_gray_u8 = None   # crop_size x crop_size (uint8)
-        self.last_obs_u8 = None         # obs_out_size x obs_out_size (uint8)  # (창은 안 띄우지만 저장은 가능)
-
-        # PROF
-        self.prof_enabled = True
-        self.prof_every = 200
-        self._prof_i = 0
-        self._t_det = 0.0
-        self._t_crop = 0.0
-        self._t_gray_resize = 0.0
-        self._t_meta = 0.0
-        self._t_fallback = 0.0
 
         # playfield width 캐시
         self._playfield_ratio = float(getattr(self.screen, "PLAYFIELD_RIGHT_RATIO", 0.70))
         self._playfield_w = max(1, min(self.W, int(self.W * self._playfield_ratio)))
+
+        # -------------------------
+        # ✅ "AI가 보는 crop" 디버그 (창 1개만)
+        # -------------------------
+        self.show_obs_debug = False
+        self.win_crop = "OBS_CROP"
+        self._obs_win_inited = False
+
+        # ✅ 더 오른쪽으로
+        self._obs_win_pos = (2350, 60)     # 필요하면 더 키워도 됨
+        self._obs_win_size = (520, 520)
+
+        self.last_crop_gray_u8 = None
+        self._prev_crop_gray_u8 = None
 
     def reset(self):
         if hasattr(self.det, "reset"):
             self.det.reset()
 
         self.player_center = (self.W // 2, int(self.H * 0.78))
-        self._last_conf = 0.0
         self._lost_obs = 0
 
         self.last_xy_norm = (0.5, 0.78)
@@ -107,45 +104,19 @@ class ObsBuilder:
         self._dbg_last = None
 
         self.last_crop_gray_u8 = None
-        self.last_obs_u8 = None
+        self._prev_crop_gray_u8 = None
 
-        self._prof_i = 0
-        self._t_det = 0.0
-        self._t_crop = 0.0
-        self._t_gray_resize = 0.0
-        self._t_meta = 0.0
-        self._t_fallback = 0.0
-
-    # -------------------------
-    # (NEW) crop 디버그창 1개만 init
-    # -------------------------
-    def _ensure_crop_window(self):
-        if self._crop_win_inited:
+    def _ensure_obs_window(self):
+        if self._obs_win_inited:
             return
         try:
             cv2.namedWindow(self.win_crop, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(self.win_crop, int(self.win_w), int(self.win_h))
-            cv2.moveWindow(self.win_crop, int(self.win_x), int(self.win_y))
+            cv2.moveWindow(self.win_crop, int(self._obs_win_pos[0]), int(self._obs_win_pos[1]))
+            cv2.resizeWindow(self.win_crop, int(self._obs_win_size[0]), int(self._obs_win_size[1]))
         except Exception:
             pass
-        self._crop_win_inited = True
+        self._obs_win_inited = True
 
-    def _show_crop_debug(self, crop_gray_u8: np.ndarray):
-        if not self.show_obs_debug:
-            return
-        try:
-            self._ensure_crop_window()
-
-            # crop_gray_u8는 crop_size 크기(예: 256x256) 그대로.
-            # 창 크기만 키워서 보기 편하게.
-            cv2.imshow(self.win_crop, crop_gray_u8)
-            cv2.waitKey(1)
-        except Exception:
-            pass
-
-    # -------------------------
-    # crop util
-    # -------------------------
     def _crop_square_bgr(self, img_bgr, cx, cy, size):
         h, w = img_bgr.shape[:2]
         size = int(size)
@@ -185,29 +156,6 @@ class ObsBuilder:
         cy = int(np.clip(y_n * self.H, 0, self.H - 1))
         return cx, cy
 
-    def on_player_death(self):
-        if hasattr(self.det, "on_player_death"):
-            self.det.on_player_death()
-        self._lost_obs = 0
-
-    def _inject_meta_pixels(self, obs01: np.ndarray) -> np.ndarray:
-        try:
-            x_n, y_n = self.last_xy_norm
-            c = float(self.last_conf)
-
-            x_n = float(np.clip(x_n, 0.0, 1.0))
-            y_n = float(np.clip(y_n, 0.0, 1.0))
-            c = float(np.clip(c, 0.0, 1.0))
-
-            p = int(self.meta_patch)
-            if obs01.shape[0] >= p and obs01.shape[1] >= p * 3:
-                obs01[0:p, 0:p] = x_n
-                obs01[0:p, p:p * 2] = y_n
-                obs01[0:p, p * 2:p * 3] = c
-        except Exception:
-            pass
-        return obs01
-
     @staticmethod
     def _dist_norm(a_xy, b_xy) -> float:
         dx = float(a_xy[0] - b_xy[0])
@@ -222,7 +170,6 @@ class ObsBuilder:
         y_n = float(np.clip(y_n, 0.0, 1.0))
         conf = float(conf)
 
-        # 1) low conf -> hold
         if conf < float(self.conf_update_thr):
             self._lost_obs += 1
             if self._lost_obs >= int(self.lost_patience_obs):
@@ -230,7 +177,6 @@ class ObsBuilder:
                 return (x_n, y_n, conf, True, "FORCE_LOWCONF")
             return (float(prev_xy[0]), float(prev_xy[1]), float(prev_c), False, "LOWCONF_HOLD")
 
-        # 2) jump gate
         d = self._dist_norm((x_n, y_n), prev_xy)
         if d > float(self.max_jump_norm_obs):
             need = max(1e-6, prev_c) * float(self.jump_allow_conf_gain_obs)
@@ -244,12 +190,32 @@ class ObsBuilder:
                     return (x_n, y_n, conf, True, "FORCE_JUMP")
                 return (float(prev_xy[0]), float(prev_xy[1]), float(prev_c), False, "JUMP_REJECT")
 
-        # 3) ok
         self._lost_obs = 0
         return (x_n, y_n, conf, True, "OK")
 
+    def _inject_meta_pixels_ch0_only(self, obs_ch0_01: np.ndarray) -> np.ndarray:
+        """
+        obs_ch0_01: (H,W) float32 0..1
+        """
+        try:
+            x_n, y_n = self.last_xy_norm
+            c = float(self.last_conf)
+
+            x_n = float(np.clip(x_n, 0.0, 1.0))
+            y_n = float(np.clip(y_n, 0.0, 1.0))
+            c = float(np.clip(c, 0.0, 1.0))
+
+            p = int(self.meta_patch)
+            if obs_ch0_01.shape[0] >= p and obs_ch0_01.shape[1] >= p * 3:
+                obs_ch0_01[0:p, 0:p] = x_n
+                obs_ch0_01[0:p, p:p * 2] = y_n
+                obs_ch0_01[0:p, p * 2:p * 3] = c
+        except Exception:
+            pass
+        return obs_ch0_01
+
     def make_state(self, img_bgr):
-        # detector
+        # 1) detector
         det = self.det.step(img_bgr)
 
         if det is None:
@@ -267,7 +233,6 @@ class ObsBuilder:
             if used:
                 cx, cy = cx_new, cy_new
                 self.player_center = (cx, cy)
-                self._last_conf = float(c_use)
             else:
                 cx, cy = self.player_center
 
@@ -280,47 +245,38 @@ class ObsBuilder:
 
             self._dbg_last = (float(x_use), float(y_use), float(c_use), logits, float(x_raw), float(y_raw), str(reason))
 
-        # ✅ fallback: full preprocess
-        if self.use_fallback_full_preprocess and ((det is None) or (float(conf) <= 1e-6)):
-            full = self.screen.preprocess(img_bgr)  # float32 0..1
-            if full.shape != (self.obs_out_size, self.obs_out_size):
-                full = cv2.resize(full, (self.obs_out_size, self.obs_out_size), interpolation=cv2.INTER_AREA)
-            if full.dtype != np.float32:
-                full = full.astype(np.float32)
-
-            full = self._inject_meta_pixels(full)
-
-            # (선택) fallback 상황에서도 "뭔가 보이게" 하고 싶으면,
-            # 84/128 관측을 크게 띄워서 보면 됨.
-            # 지금 요청은 "crop 하나만"이지만, fallback 때 crop이 없으니
-            # 대신 full을 보여주도록 유지(원치 않으면 아래 4줄 주석 처리).
-            if self.show_obs_debug:
-                u8 = (np.clip(full, 0, 1) * 255).astype(np.uint8)
-                self.last_obs_u8 = u8
-                self._show_crop_debug(u8)
-
-            return full
-
-        # crop
+        # 2) crop
         crop_bgr = self._crop_square_bgr(img_bgr, cx, cy, self.crop_size)
-        crop_gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
 
-        # ✅ crop 창 1개만 표시
-        self.last_crop_gray_u8 = crop_gray
-        self._show_crop_debug(crop_gray)
+        # 3) gray (uint8) + diff (uint8)
+        crop_gray_u8 = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
 
-        # gray + resize -> obs
+        if self._prev_crop_gray_u8 is None or self._prev_crop_gray_u8.shape != crop_gray_u8.shape:
+            diff_u8 = np.zeros_like(crop_gray_u8)
+        else:
+            diff_u8 = cv2.absdiff(crop_gray_u8, self._prev_crop_gray_u8)
+
+        self._prev_crop_gray_u8 = crop_gray_u8
+
+        # 4) resize to obs_out_size
         interp = cv2.INTER_AREA if self.crop_size >= self.obs_out_size else cv2.INTER_LINEAR
-        obs = cv2.resize(crop_gray, (self.obs_out_size, self.obs_out_size), interpolation=interp)
-        obs = obs.astype(np.float32) / 255.0
+        ch0 = cv2.resize(crop_gray_u8, (self.obs_out_size, self.obs_out_size), interpolation=interp).astype(np.float32) / 255.0
+        ch1 = cv2.resize(diff_u8, (self.obs_out_size, self.obs_out_size), interpolation=interp).astype(np.float32) / 255.0
 
-        # meta
-        obs = self._inject_meta_pixels(obs)
+        # 5) meta는 ch0에만
+        ch0 = self._inject_meta_pixels_ch0_only(ch0)
 
-        # obs 캐시는 유지(창은 안 띄움)
-        try:
-            self.last_obs_u8 = (np.clip(obs, 0, 1) * 255).astype(np.uint8)
-        except Exception:
-            pass
+        # 6) (2, H, W)
+        obs2 = np.stack([ch0, ch1], axis=0).astype(np.float32, copy=False)
 
-        return obs
+        # 7) 디버그: crop 하나만 크게
+        if self.show_obs_debug:
+            try:
+                self._ensure_obs_window()
+                self.last_crop_gray_u8 = crop_gray_u8
+                cv2.imshow(self.win_crop, self.last_crop_gray_u8)
+                cv2.waitKey(1)
+            except Exception:
+                pass
+
+        return obs2
