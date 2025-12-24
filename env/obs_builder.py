@@ -7,13 +7,15 @@ from env.reimu_detector import ReimuDetector
 
 class ObsBuilder:
     """
-    ✅ 2채널 관측
-      - ch0: 현재 crop_gray (0..1)
+    ✅ 4채널 관측 (권장: 탄 인식 강화)
+      - ch0: 현재 crop_gray (0..1)  + meta pixels(레이무 xy/conf)
       - ch1: absdiff(current_crop_gray, prev_crop_gray) (0..1)
+      - ch2: bullet_candidate_mask (0..1)  [HSV/밝기/채도 기반]
+      - ch3: risk_heatmap_centered (0..1)  [distanceTransform + 중심 가중치]
 
-    ✅ 리턴 shape: (2, obs_out_size, obs_out_size)  float32
+    ✅ 리턴 shape: (4, obs_out_size, obs_out_size)  float32
 
-    ✅ 디버그: crop 원본(gray, crop_size x crop_size) 창 1개만 표시
+    ✅ 디버그: crop(gray) / bullet_mask / risk_heat 를 합성해서 표시(옵션)
     """
 
     def __init__(self, screen, debug_viz=None, obs_out_size=84, crop_size=160, use_fallback_full_preprocess=True):
@@ -25,7 +27,7 @@ class ObsBuilder:
         self.use_fallback_full_preprocess = bool(use_fallback_full_preprocess)
 
         # ✅ 외부에서 채널 수를 알 수 있게
-        self.obs_channels = 2
+        self.obs_channels = 4
 
         img0 = self.screen.capture()
         h0, w0 = img0.shape[:2]
@@ -79,18 +81,40 @@ class ObsBuilder:
         self._playfield_w = max(1, min(self.W, int(self.W * self._playfield_ratio)))
 
         # -------------------------
-        # ✅ "AI가 보는 crop" 디버그 (창 1개만)
+        # ✅ "AI가 보는 crop" 디버그
         # -------------------------
         self.show_obs_debug = False
         self.win_crop = "OBS_CROP"
         self._obs_win_inited = False
 
-        # ✅ 더 오른쪽으로
-        self._obs_win_pos = (2350, 60)     # 필요하면 더 키워도 됨
+        self._obs_win_pos = (2350, 60)
         self._obs_win_size = (520, 520)
 
         self.last_crop_gray_u8 = None
         self._prev_crop_gray_u8 = None
+
+        # -------------------------
+        # ✅ 탄 후보 마스크 / 위험도 히트맵 설정
+        # -------------------------
+        self.enable_bullet_channels = True
+
+        # (1) HSV 기반 탄 후보: 밝고(s/v) 채도(s) 높은 픽셀을 탄 후보로 간주
+        #    ※ 루나틱 탄막은 보통 채도/밝기가 높아서 이게 꽤 먹힘.
+        self.bullet_hsv_s_min = 80     # 채도 하한
+        self.bullet_hsv_v_min = 160    # 밝기 하한
+        self.bullet_hsv_v_max = 255
+        self.bullet_close_morph = 1    # 0이면 off, 1~2 추천 (노이즈 정리)
+
+        # (2) 위험도 변환 파라미터
+        # distTransform 결과(dist 픽셀)를 tau로 나눠 exp(-dist/tau)
+        self.risk_tau_px = 8.0
+
+        # 중심 가중치: 레이무(crop 중심)에서 멀수록 약하게.
+        # exp(-(r^2)/(2*sigma^2))
+        self.center_sigma_px = float(self.crop_size) * 0.35
+
+        # 안전장치: 너무 강한 값 튀는 걸 막는 clip
+        self.risk_clip_max = 1.0
 
     def reset(self):
         if hasattr(self.det, "reset"):
@@ -214,6 +238,66 @@ class ObsBuilder:
             pass
         return obs_ch0_01
 
+    def _compute_bullet_mask_u8(self, crop_bgr: np.ndarray) -> np.ndarray:
+        """
+        crop_bgr: (crop_size, crop_size, 3) BGR
+        return: bullet_mask_u8 (0 or 255), shape (crop_size, crop_size)
+        """
+        # HSV threshold
+        hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+
+        s = hsv[:, :, 1]
+        v = hsv[:, :, 2]
+
+        # 채도 & 밝기 높은 픽셀만 탄 후보로
+        mask = (s >= int(self.bullet_hsv_s_min)) & (v >= int(self.bullet_hsv_v_min)) & (v <= int(self.bullet_hsv_v_max))
+        mask_u8 = (mask.astype(np.uint8) * 255)
+
+        # 노이즈 정리(선택)
+        k = int(self.bullet_close_morph)
+        if k > 0:
+            ksz = 2 * k + 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksz, ksz))
+            mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel, iterations=1)
+            mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+        return mask_u8
+
+    def _compute_risk_heat_centered(self, bullet_mask_u8: np.ndarray) -> np.ndarray:
+        """
+        bullet_mask_u8: 0/255, 탄 후보 픽셀=255
+        return: risk01 float32 (crop_size, crop_size), 0..1
+        """
+        # distanceTransform은 "0인 픽셀까지의 거리"를 구함
+        # => 탄 픽셀을 0으로 만들기 위해 invert
+        inv = cv2.bitwise_not(bullet_mask_u8)  # 탄=0, 배경=255
+        dist = cv2.distanceTransform(inv, distanceType=cv2.DIST_L2, maskSize=3)  # float32, 픽셀 단위 거리
+
+        tau = max(1e-6, float(self.risk_tau_px))
+        risk = np.exp(-dist / tau).astype(np.float32)  # 탄 근처=1, 멀수록 0
+
+        # 레이무 중심(=crop 중심) 가중치
+        h, w = risk.shape[:2]
+        cx = (w - 1) * 0.5
+        cy = (h - 1) * 0.5
+
+        yy, xx = np.indices((h, w), dtype=np.float32)
+        rr2 = (xx - cx) ** 2 + (yy - cy) ** 2
+        sigma = max(1e-6, float(self.center_sigma_px))
+        center_w = np.exp(-rr2 / (2.0 * sigma * sigma)).astype(np.float32)
+
+        risk_centered = risk * center_w
+
+        # 정규화/클립 (너무 약해지면 학습이 안 보여서, max로 나눠 스케일 업)
+        m = float(risk_centered.max())
+        if m > 1e-6:
+            risk_centered = risk_centered / m
+
+        if self.risk_clip_max is not None:
+            risk_centered = np.clip(risk_centered, 0.0, float(self.risk_clip_max))
+
+        return risk_centered.astype(np.float32, copy=False)
+
     def make_state(self, img_bgr):
         # 1) detector
         det = self.det.step(img_bgr)
@@ -258,25 +342,48 @@ class ObsBuilder:
 
         self._prev_crop_gray_u8 = crop_gray_u8
 
+        # 3.5) bullet mask + risk heat (crop_size 기준)
+        if self.enable_bullet_channels:
+            bullet_mask_u8 = self._compute_bullet_mask_u8(crop_bgr)  # 0/255
+            risk_crop_01 = self._compute_risk_heat_centered(bullet_mask_u8)  # 0..1 float32
+        else:
+            bullet_mask_u8 = np.zeros_like(crop_gray_u8, dtype=np.uint8)
+            risk_crop_01 = np.zeros((self.crop_size, self.crop_size), dtype=np.float32)
+
         # 4) resize to obs_out_size
         interp = cv2.INTER_AREA if self.crop_size >= self.obs_out_size else cv2.INTER_LINEAR
+
         ch0 = cv2.resize(crop_gray_u8, (self.obs_out_size, self.obs_out_size), interpolation=interp).astype(np.float32) / 255.0
         ch1 = cv2.resize(diff_u8, (self.obs_out_size, self.obs_out_size), interpolation=interp).astype(np.float32) / 255.0
+
+        ch2 = cv2.resize(bullet_mask_u8, (self.obs_out_size, self.obs_out_size), interpolation=interp).astype(np.float32) / 255.0
+        ch3 = cv2.resize(risk_crop_01, (self.obs_out_size, self.obs_out_size), interpolation=interp).astype(np.float32)
 
         # 5) meta는 ch0에만
         ch0 = self._inject_meta_pixels_ch0_only(ch0)
 
-        # 6) (2, H, W)
-        obs2 = np.stack([ch0, ch1], axis=0).astype(np.float32, copy=False)
+        # 6) (4, H, W)
+        obs4 = np.stack([ch0, ch1, ch2, ch3], axis=0).astype(np.float32, copy=False)
 
-        # 7) 디버그: crop 하나만 크게
+        # 7) 디버그: 합성 표시(옵션)
         if self.show_obs_debug:
             try:
                 self._ensure_obs_window()
-                self.last_crop_gray_u8 = crop_gray_u8
-                cv2.imshow(self.win_crop, self.last_crop_gray_u8)
+
+                # 보기 좋게 3분할(그레이 / 마스크 / 리스크)
+                g = crop_gray_u8
+                m = bullet_mask_u8
+                r = (np.clip(risk_crop_01, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+                # 3채널로 맞춰서 concat
+                g3 = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+                m3 = cv2.cvtColor(m, cv2.COLOR_GRAY2BGR)
+                r3 = cv2.cvtColor(r, cv2.COLOR_GRAY2BGR)
+
+                vis = np.concatenate([g3, m3, r3], axis=1)
+                cv2.imshow(self.win_crop, vis)
                 cv2.waitKey(1)
             except Exception:
                 pass
 
-        return obs2
+        return obs4
