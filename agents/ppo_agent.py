@@ -13,33 +13,36 @@ class PPOAgent:
         input_channels,
         num_actions,
 
-        # ✅ 추가: 프레임당 obs 채널 수(= ObsBuilder.obs_channels)
+        # 프레임당 obs 채널 수(= ObsBuilder.obs_channels)
         obs_channels_per_frame=4,
 
-        lr=2.5e-4,
+        # ===== 학습률/할인 =====
+        lr=3.0e-4,          # (기존 2.5e-4) 적응 속도 약간↑
         gamma=0.99,
         gae_lambda=0.95,
-        clip_eps=0.2,
+
+        # ===== PPO 안정성(8방향 적응 빠르게) =====
+        clip_eps=0.15,      # (기존 0.2) 초기에 폭주 방지
         vf_coef=0.5,
 
-        # =========================
-        # ✅ 탐색(Entropy) 강화 기본값
-        # =========================
-        ent_coef=0.03,
-        ent_min=0.01,
-        ent_decay=0.9999,
+        # ===== 탐색(Entropy): 짧게 강하게 → 빨리 감소 =====
+        ent_coef=0.04,      # (기존 0.03) 초반 탐색↑ (새 액션공간 적응)
+        ent_min=0.005,      # (기존 0.01) 최저 탐색은 더 낮게
+        ent_decay=0.9995,   # (기존 0.9999) 더 빨리 감소
 
-        rollout_steps=256,
-        update_epochs=4,
+        # ===== 업데이트 템포: 더 자주 업데이트 =====
+        rollout_steps=128,  # (기존 256) 적응 속도↑
+        update_epochs=5,    # (기존 4) 샘플 효율↑
         mini_batch_size=64,
+
         device=None,
         max_grad_norm=0.5,
 
-        # =========================
-        # ✅ 엔트로피 warmup (초반 강제 유지)
-        # =========================
-        ent_warmup_updates=50,
+        # ===== 엔트로피 warmup =====
+        ent_warmup_updates=30,  # (기존 50) 더 빨리 “정착” 모드로
     ):
+        ...
+
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
         self.model = ActorCriticCNN(

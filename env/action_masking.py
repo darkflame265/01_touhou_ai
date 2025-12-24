@@ -26,9 +26,6 @@ class ActionMasker:
         self.cfg = cfg
 
     def _action_dir(self, action_enum) -> Tuple[int, int]:
-        """
-        value는 ["LEFT"], ["UP","RIGHT"] 같이 방향키만 들어있다고 가정.
-        """
         keys = set(action_enum.value)
         dx = (-1 if "LEFT" in keys else (1 if "RIGHT" in keys else 0))
         dy = (-1 if "UP" in keys else (1 if "DOWN" in keys else 0))
@@ -39,11 +36,15 @@ class ActionMasker:
 
         def repl(k: str) -> str:
             if flip_x:
-                if k == "LEFT": return "RIGHT"
-                if k == "RIGHT": return "LEFT"
+                if k == "LEFT":
+                    return "RIGHT"
+                if k == "RIGHT":
+                    return "LEFT"
             if flip_y:
-                if k == "UP": return "DOWN"
-                if k == "DOWN": return "UP"
+                if k == "UP":
+                    return "DOWN"
+                if k == "DOWN":
+                    return "UP"
             return k
 
         new_keys = [repl(k) for k in keys]
@@ -82,9 +83,6 @@ class ActionMasker:
             top_forbid = (py <= top_line)
 
         for i, a in enumerate(ACTIONS):
-            if a.name == "NONE":
-                continue
-
             dx, dy = self._action_dir(a)
 
             if near_left and dx < 0:
@@ -102,21 +100,14 @@ class ActionMasker:
         return mask
 
     def apply_action_mask(self, action_idx: int, img_bgr):
-        # ✅ 안전장치: idx 범위 밖이면 NONE으로
-        try:
-            ai = int(action_idx)
-        except Exception:
-            ai = 0
-        if not (0 <= ai < len(ACTIONS)):
-            ai = 0
-
         mask = self.get_action_mask(img_bgr)
 
-        # 이미 유효하면 그대로
-        if bool(mask[ai]):
-            return ai, False, mask
+        # 1) 원래 액션이 허용이면 그대로
+        if 0 <= int(action_idx) < len(ACTIONS) and bool(mask[int(action_idx)]):
+            return int(action_idx), False, mask
 
-        orig = ACTIONS[ai]
+        # 2) flip 기반 대체 시도
+        orig = ACTIONS[int(action_idx)]
         pc = getattr(self.obs, "player_center", None)
 
         flip_x = False
@@ -140,7 +131,6 @@ class ActionMasker:
             if (top_d <= margin_px and dy < 0) or (bot_d <= margin_px and dy > 0):
                 flip_y = True
 
-            # top-limit 걸리면 UP은 DOWN으로 치환 시도
             if self.cfg.top_limit_px is not None:
                 top_forbid = (py <= (t + int(self.cfg.top_limit_px)))
                 if top_forbid and dy < 0:
@@ -153,12 +143,12 @@ class ActionMasker:
         try:
             alt_idx = ACTIONS.index(alt)
         except ValueError:
-            alt_idx = 0  # NONE
+            alt_idx = 0
 
         if 0 <= alt_idx < len(ACTIONS) and bool(mask[alt_idx]):
             return int(alt_idx), True, mask
 
-        # 마지막 보정: UP 계열이면 DOWN 계열 강제 시도
+        # 3) 마지막 보정: UP 계열이면 DOWN 계열 강제 시도
         if pc is not None:
             dx, dy = self._action_dir(orig)
             if dy < 0:
@@ -170,4 +160,16 @@ class ActionMasker:
                 except ValueError:
                     pass
 
+        # 4) 그래도 안 되면 "가장 무난한" fallback: SLOW_DOWN(있다면)
+        fallback_name = "SLOW_DOWN"
+        for i, a in enumerate(ACTIONS):
+            if a.name == fallback_name and bool(mask[i]):
+                return int(i), True, mask
+
+        # 최후: 첫 번째 허용 액션
+        for i in range(len(ACTIONS)):
+            if bool(mask[i]):
+                return int(i), True, mask
+
+        # 진짜 최후(전부 False는 거의 안 나와야 정상)
         return 0, True, mask

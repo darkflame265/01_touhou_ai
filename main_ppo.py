@@ -334,6 +334,29 @@ def main():
     else:
         print("[PPO] no checkpoint found, training from scratch" if not is_eval else "[PPO][EVAL] no checkpoint found (evaluating random policy)")
 
+    # =========================================================
+    # ✅ 액션공간 전환기: ckpt 로드 후 하이퍼파라미터 강제 재설정
+    #    (8방향 고정 + 상시 slow 최적화)
+    # =========================================================
+    agent.ent_coef = 0.04
+    agent.ent_min = 0.005
+    agent.ent_decay = 0.9995
+    agent.ent_warmup_updates = 30
+
+    agent.clip_eps = 0.15
+    agent.rollout_steps = 128
+    agent.update_epochs = 5
+
+    print(
+        "[PPO][OVERRIDE] hyperparams overridden after ckpt load | "
+        f"ent_coef={agent.ent_coef:.3f}, "
+        f"ent_min={agent.ent_min:.3f}, "
+        f"clip_eps={agent.clip_eps:.2f}, "
+        f"rollout_steps={agent.rollout_steps}, "
+        f"update_epochs={agent.update_epochs}"
+    )
+
+
     print("\n[INFO] ESC 중단: Windows 전역 감지(GetAsyncKeyState)")
     print(" - 게임 창이 포커스여도 ESC를 잡고 즉시 종료합니다.\n")
     time.sleep(0.7)

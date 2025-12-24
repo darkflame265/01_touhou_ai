@@ -24,14 +24,12 @@ class ObsBuilder:
         self.crop_size = int(crop_size)
         self.use_fallback_full_preprocess = bool(use_fallback_full_preprocess)
 
-        # ✅ 외부에서 채널 수를 알 수 있게
         self.obs_channels = 4
 
         img0 = self.screen.capture()
         h0, w0 = img0.shape[:2]
         self.H, self.W = h0, w0
 
-        # ✅ 레이무 검출기(히트맵)
         self.det = ReimuDetector(
             screen=self.screen,
             weight_path="weights/reimu_heatmap_best.pt",
@@ -65,14 +63,13 @@ class ObsBuilder:
         self.lost_patience_obs = 10
         self._lost_obs = 0
 
-        # 디버그용(원하면 확장)
         self._dbg_last = None
 
         # 정책/리워드용 좌표/신뢰도
         self.last_xy_norm = (0.5, 0.78)
         self.last_conf = 0.0
 
-        # ✅ 메타 픽셀 설정 (ch0에만)
+        # meta pixels
         self.meta_patch = 4
 
         # playfield width 캐시
@@ -95,35 +92,35 @@ class ObsBuilder:
         # -------------------------
         self.enable_bullet_channels = True
 
-        # HSV 기반 탄 후보
-        self.bullet_hsv_s_min = 40     # 채도 하한
-        self.bullet_hsv_v_min = 140    # 밝기 하한
+        self.bullet_hsv_s_min = 40
+        self.bullet_hsv_v_min = 140
         self.bullet_hsv_v_max = 255
-        self.bullet_close_morph = 0    # 0이면 off, 1~2 추천
+        self.bullet_close_morph = 0
 
-        # 위험도 변환 파라미터
         self.risk_tau_px = 8.0
-
-        # 중심 가중치 sigma
         self.center_sigma_px = float(self.crop_size) * 0.35
-
-        # 안전장치 clip
         self.risk_clip_max = 1.0
 
         # -------------------------
-        # ✅ 화면 안정화(스무딩)
+        # ✅ 화면 안정화(딜레이 최소화 버전)
         # -------------------------
-        # crop 중심(=player_center) EMA: 0~1, 클수록 "이전 중심을 더 믿음" => 더 부드럽지만 반응 느림
-        self.crop_center_ema_alpha = 0.65
+        # (A) crop 중심: "속도 제한" (프레임당 최대 이동 픽셀)
+        self.center_max_speed_px = 10.0
+
+        # 선택 옵션: 미세 EMA (0이면 OFF). speed-limit 후에 아주 약하게만 적용 가능.
+        #  - 0.0~0.2 정도 추천. (0이면 완전 OFF)
+        self.center_micro_ema_alpha = 0.0
+
         self._crop_center_f = None  # (cx_f, cy_f) float
 
-        # risk map EMA: 프레임간 risk 깜빡임 감소
-        self.risk_ema_alpha = 0.60
-        self._prev_risk_crop_01 = None  # (crop_size, crop_size) float32
+        # (B) risk 안정화: "max-hold + decay"
+        #  - 위험도 증가: 즉시 반영(딜레이 거의 없음)
+        #  - 위험도 감소: decay로 천천히 내려가 깜빡임 감소
+        self.risk_decay = 0.70
+        self._risk_hold_crop_01 = None  # (crop_size, crop_size) float32
 
-        # resize 후 약한 블러로 aliasing 완화 (0이면 off)
-        self.post_resize_blur_ksize = 3
-
+        # resize 후 약한 블러로 aliasing 완화 (0이면 off, 3 또는 5 추천)
+        self.post_resize_blur_ksize = 0
 
     def reset(self):
         if hasattr(self.det, "reset"):
@@ -137,10 +134,8 @@ class ObsBuilder:
         self._dbg_last = None
 
         self._prev_crop_gray_u8 = None
-
         self._crop_center_f = None
-        self._prev_risk_crop_01 = None
-
+        self._risk_hold_crop_01 = None
 
     def _ensure_obs_window(self):
         if self._obs_win_inited:
@@ -172,9 +167,7 @@ class ObsBuilder:
         pad_b = max(0, y2 - h)
 
         img_pad = cv2.copyMakeBorder(
-            img_bgr,
-            pad_t, pad_b, pad_l, pad_r,
-            borderType=cv2.BORDER_REFLECT_101
+            img_bgr, pad_t, pad_b, pad_l, pad_r, borderType=cv2.BORDER_REFLECT_101
         )
 
         x1 += pad_l
@@ -241,17 +234,13 @@ class ObsBuilder:
             p = int(self.meta_patch)
             if obs_ch0_01.shape[0] >= p and obs_ch0_01.shape[1] >= p * 3:
                 obs_ch0_01[0:p, 0:p] = x_n
-                obs_ch0_01[0:p, p:p * 2] = y_n
-                obs_ch0_01[0:p, p * 2:p * 3] = c
+                obs_ch0_01[0:p, p:2 * p] = y_n
+                obs_ch0_01[0:p, 2 * p:3 * p] = c
         except Exception:
             pass
         return obs_ch0_01
 
     def _compute_bullet_mask_u8(self, crop_bgr: np.ndarray) -> np.ndarray:
-        """
-        crop_bgr: (crop_size, crop_size, 3) BGR
-        return: bullet_mask_u8 (0 or 255), shape (crop_size, crop_size)
-        """
         hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
         s = hsv[:, :, 1]
         v = hsv[:, :, 2]
@@ -269,11 +258,6 @@ class ObsBuilder:
         return mask_u8
 
     def _compute_risk_heat_centered(self, bullet_mask_u8: np.ndarray, center_xy=None) -> np.ndarray:
-        """
-        bullet_mask_u8: 0/255, 탄 후보 픽셀=255
-        center_xy: (cx, cy) in crop pixel coords. None이면 crop center 사용
-        return: risk01 float32 (crop_size, crop_size), 0..1
-        """
         inv = cv2.bitwise_not(bullet_mask_u8)  # 탄=0, 배경=255
         dist = cv2.distanceTransform(inv, distanceType=cv2.DIST_L2, maskSize=3)
 
@@ -307,6 +291,22 @@ class ObsBuilder:
 
         return risk_centered.astype(np.float32, copy=False)
 
+    def _center_speed_limit(self, prev_xy_f, target_xy_i):
+        """프레임당 이동량을 max_speed로 제한 (딜레이 최소화 스무딩)"""
+        px, py = float(prev_xy_f[0]), float(prev_xy_f[1])
+        tx, ty = float(target_xy_i[0]), float(target_xy_i[1])
+
+        dx = tx - px
+        dy = ty - py
+        dist = float((dx * dx + dy * dy) ** 0.5)
+
+        vmax = max(1e-6, float(self.center_max_speed_px))
+        if dist <= vmax:
+            return (tx, ty)
+
+        s = vmax / dist
+        return (px + dx * s, py + dy * s)
+
     def make_state(self, img_bgr):
         # 1) detector
         det = self.det.step(img_bgr)
@@ -330,23 +330,23 @@ class ObsBuilder:
 
             self._dbg_last = (float(x_use), float(y_use), float(c_use), logits, str(reason))
 
-        # 2) crop (✅ 중심 EMA로 안정화)
+        # 2) crop 중심 안정화: speed-limit + (옵션) micro EMA
         cx_i, cy_i = int(cx), int(cy)
-
         if self._crop_center_f is None:
             self._crop_center_f = (float(cx_i), float(cy_i))
         else:
-            a = float(self.crop_center_ema_alpha)
-            px_f, py_f = self._crop_center_f
-            nx_f = a * px_f + (1.0 - a) * float(cx_i)
-            ny_f = a * py_f + (1.0 - a) * float(cy_i)
-            self._crop_center_f = (nx_f, ny_f)
+            nx, ny = self._center_speed_limit(self._crop_center_f, (cx_i, cy_i))
+            a = float(self.center_micro_ema_alpha)
+            if a > 0.0:
+                px, py = self._crop_center_f
+                nx = a * px + (1.0 - a) * nx
+                ny = a * py + (1.0 - a) * ny
+            self._crop_center_f = (nx, ny)
 
         cx_s = int(round(self._crop_center_f[0]))
         cy_s = int(round(self._crop_center_f[1]))
 
         crop_bgr = self._crop_square_bgr(img_bgr, cx_s, cy_s, self.crop_size)
-
 
         # 3) gray + diff
         crop_gray_u8 = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
@@ -360,34 +360,30 @@ class ObsBuilder:
         if self.enable_bullet_channels:
             bullet_mask_u8 = self._compute_bullet_mask_u8(crop_bgr)
 
-            # 레이무 추정 좌표를 crop 내부 픽셀로 변환해 center로 사용
             try:
                 half = 0.5 * float(self.crop_size)
                 if det is None:
                     center_xy = (half, half)
                 else:
-                    # last_xy_norm은 "게이트 적용된 추정치"
                     cx_target, cy_target = self._playfield_norm_to_full_xy(self.last_xy_norm[0], self.last_xy_norm[1])
                     dx = float(cx_target - cx_s)
                     dy = float(cy_target - cy_s)
                     center_xy = (half + dx, half + dy)
-
             except Exception:
                 center_xy = None
 
-            risk_crop_01 = self._compute_risk_heat_centered(bullet_mask_u8, center_xy=center_xy)
-            
-            # ✅ risk 프레임간 EMA (깜빡임 감소)
-            if self._prev_risk_crop_01 is None or self._prev_risk_crop_01.shape != risk_crop_01.shape:
-                self._prev_risk_crop_01 = risk_crop_01.astype(np.float32, copy=True)
+            risk_now = self._compute_risk_heat_centered(bullet_mask_u8, center_xy=center_xy)
+
+            # ✅ max-hold + decay (증가 즉시, 감소 완만)
+            if self._risk_hold_crop_01 is None or self._risk_hold_crop_01.shape != risk_now.shape:
+                self._risk_hold_crop_01 = risk_now.astype(np.float32, copy=True)
             else:
-                a = float(self.risk_ema_alpha)
-                self._prev_risk_crop_01 = (a * self._prev_risk_crop_01 + (1.0 - a) * risk_crop_01).astype(np.float32, copy=False)
+                decay = float(np.clip(self.risk_decay, 0.0, 1.0))
+                self._risk_hold_crop_01 = np.maximum(self._risk_hold_crop_01 * decay, risk_now).astype(np.float32, copy=False)
 
-            risk_crop_01 = self._prev_risk_crop_01
-
+            risk_crop_01 = self._risk_hold_crop_01
         else:
-            bullet_mask_u8 = np.zeros_like(crop_gray_u8, dtype=np.uint8)
+            bullet_mask_u8 = np.zeros((self.crop_size, self.crop_size), dtype=np.uint8)
             risk_crop_01 = np.zeros((self.crop_size, self.crop_size), dtype=np.float32)
 
         # 4) resize
@@ -398,22 +394,27 @@ class ObsBuilder:
         ch2 = cv2.resize(bullet_mask_u8, (self.obs_out_size, self.obs_out_size), interpolation=interp).astype(np.float32) / 255.0
         ch3 = cv2.resize(risk_crop_01, (self.obs_out_size, self.obs_out_size), interpolation=interp).astype(np.float32)
 
+        # (옵션) post blur로 깜빡임/alias 완화
+        k = int(self.post_resize_blur_ksize)
+        if k and k >= 3 and (k % 2 == 1):
+            ch0 = cv2.GaussianBlur(ch0, (k, k), 0)
+            ch1 = cv2.GaussianBlur(ch1, (k, k), 0)
+            ch2 = cv2.GaussianBlur(ch2, (k, k), 0)
+            ch3 = cv2.GaussianBlur(ch3, (k, k), 0)
+
         # 5) meta는 ch0에만
         ch0 = self._inject_meta_pixels_ch0_only(ch0)
 
         obs4 = np.stack([ch0, ch1, ch2, ch3], axis=0).astype(np.float32, copy=False)
 
-        # 6) 디버그: bullet_mask만 크게 표시
+        # 6) 디버그: ch3(최종 입력과 동일) 표시
         if self.show_obs_debug:
             try:
                 self._ensure_obs_window()
-
-                # ch3를 실제 입력과 동일하게 보기 (obs_out_size)
                 dbg = (np.clip(ch3, 0.0, 1.0) * 255.0).astype(np.uint8)
                 vis = cv2.cvtColor(dbg, cv2.COLOR_GRAY2BGR)
                 cv2.imshow(self.win_crop, vis)
                 cv2.waitKey(1)
-
             except Exception:
                 pass
 
