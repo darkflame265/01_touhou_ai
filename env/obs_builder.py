@@ -7,15 +7,13 @@ from env.reimu_detector import ReimuDetector
 
 class ObsBuilder:
     """
-    ✅ 4채널 관측 (권장: 탄 인식 강화)
-      - ch0: 현재 crop_gray (0..1)  + meta pixels(레이무 xy/conf)
+    ✅ 4채널 관측
+      - ch0: 현재 crop_gray (0..1) + meta pixels(레이무 xy/conf)
       - ch1: absdiff(current_crop_gray, prev_crop_gray) (0..1)
       - ch2: bullet_candidate_mask (0..1)  [HSV/밝기/채도 기반]
-      - ch3: risk_heatmap_centered (0..1)  [distanceTransform + (레이무 위치 기반) 중심 가중치]
+      - ch3: risk_heatmap_centered (0..1)  [distanceTransform + (레이무기반) 중심 가중치]
 
-    ✅ 리턴 shape: (4, obs_out_size, obs_out_size)  float32
-
-    ✅ 디버그: (선택) OBS_CROP 창에 bullet_mask만 크게 표시
+    ✅ 리턴 shape: (4, obs_out_size, obs_out_size) float32
     """
 
     def __init__(self, screen, debug_viz=None, obs_out_size=84, crop_size=160, use_fallback_full_preprocess=True):
@@ -81,20 +79,18 @@ class ObsBuilder:
         self._playfield_w = max(1, min(self.W, int(self.W * self._playfield_ratio)))
 
         # -------------------------
-        # ✅ OBS_CROP 디버그
+        # ✅ OBS 디버그 창(가운데 화면만 크게)
         # -------------------------
         self.show_obs_debug = True
         self.win_crop = "OBS_CROP"
         self._obs_win_inited = False
-
-        # 너가 조절하던 위치/크기
         self._obs_win_pos = (1600, 60)
         self._obs_win_size = (600, 600)
 
         self._prev_crop_gray_u8 = None
 
         # -------------------------
-        # ✅ 탄 후보 마스크 / 위험도 히트맵 설정
+        # ✅ 탄 후보 마스크 / 위험도 히트맵
         # -------------------------
         self.enable_bullet_channels = True
 
@@ -102,7 +98,7 @@ class ObsBuilder:
         self.bullet_hsv_s_min = 40     # 채도 하한
         self.bullet_hsv_v_min = 140    # 밝기 하한
         self.bullet_hsv_v_max = 255
-        self.bullet_close_morph = 0    # 0이면 off
+        self.bullet_close_morph = 0    # 0이면 off, 1~2 추천
 
         # 위험도 변환 파라미터
         self.risk_tau_px = 8.0
@@ -110,7 +106,7 @@ class ObsBuilder:
         # 중심 가중치 sigma
         self.center_sigma_px = float(self.crop_size) * 0.35
 
-        # clip
+        # 안전장치 clip
         self.risk_clip_max = 1.0
 
     def reset(self):
@@ -214,9 +210,6 @@ class ObsBuilder:
         return (x_n, y_n, conf, True, "OK")
 
     def _inject_meta_pixels_ch0_only(self, obs_ch0_01: np.ndarray) -> np.ndarray:
-        """
-        obs_ch0_01: (H,W) float32 0..1
-        """
         try:
             x_n, y_n = self.last_xy_norm
             c = float(self.last_conf)
@@ -234,7 +227,7 @@ class ObsBuilder:
             pass
         return obs_ch0_01
 
-    # ✅✅✅ 여기 “복구”가 핵심
+    # ✅ (복구) 탄 후보 마스크 함수 - 이게 없어서 에러났던 것
     def _compute_bullet_mask_u8(self, crop_bgr: np.ndarray) -> np.ndarray:
         """
         crop_bgr: (crop_size, crop_size, 3) BGR
@@ -256,7 +249,7 @@ class ObsBuilder:
 
         return mask_u8
 
-    # ✅ 중복 정의 금지: center_xy 받는 버전 “하나만”
+    # ✅ (정리) risk는 이 “한 개”만 유지 (center_xy 지원)
     def _compute_risk_heat_centered(self, bullet_mask_u8: np.ndarray, center_xy=None) -> np.ndarray:
         """
         bullet_mask_u8: 0/255, 탄 후보 픽셀=255
@@ -302,6 +295,7 @@ class ObsBuilder:
 
         if det is None:
             cx, cy = self.player_center
+            conf = 0.0
             self._dbg_last = None
         else:
             x_n, y_n, conf, logits = det
@@ -317,33 +311,24 @@ class ObsBuilder:
             else:
                 cx, cy = self.player_center
 
-            x_raw, y_raw = float(x_n), float(y_n)
-            try:
-                if hasattr(self.det, "last_raw_xy") and (self.det.last_raw_xy is not None):
-                    x_raw, y_raw = self.det.last_raw_xy
-            except Exception:
-                pass
-
-            self._dbg_last = (float(x_use), float(y_use), float(c_use), logits, float(x_raw), float(y_raw), str(reason))
+            self._dbg_last = (float(x_use), float(y_use), float(c_use), logits, str(reason))
 
         # 2) crop
         crop_bgr = self._crop_square_bgr(img_bgr, cx, cy, self.crop_size)
 
-        # 3) gray (uint8) + diff (uint8)
+        # 3) gray + diff
         crop_gray_u8 = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-
         if self._prev_crop_gray_u8 is None or self._prev_crop_gray_u8.shape != crop_gray_u8.shape:
             diff_u8 = np.zeros_like(crop_gray_u8)
         else:
             diff_u8 = cv2.absdiff(crop_gray_u8, self._prev_crop_gray_u8)
-
         self._prev_crop_gray_u8 = crop_gray_u8
 
-        # 3.5) bullet mask + risk heat
+        # 3.5) bullet mask + risk (레이무 위치 기반 중심)
         if self.enable_bullet_channels:
-            bullet_mask_u8 = self._compute_bullet_mask_u8(crop_bgr)  # 0/255
+            bullet_mask_u8 = self._compute_bullet_mask_u8(crop_bgr)
 
-            # ✅ 레이무 위치 기반 중심(center_xy): "crop 내부 좌표"로 변환
+            # ✅ 레이무 추정 좌표를 crop 내부 픽셀로 변환해 center로 사용
             try:
                 half = 0.5 * float(self.crop_size)
                 if det is None:
@@ -358,10 +343,10 @@ class ObsBuilder:
 
             risk_crop_01 = self._compute_risk_heat_centered(bullet_mask_u8, center_xy=center_xy)
         else:
-            bullet_mask_u8 = np.zeros((self.crop_size, self.crop_size), dtype=np.uint8)
+            bullet_mask_u8 = np.zeros_like(crop_gray_u8, dtype=np.uint8)
             risk_crop_01 = np.zeros((self.crop_size, self.crop_size), dtype=np.float32)
 
-        # 4) resize to obs_out_size
+        # 4) resize
         interp = cv2.INTER_AREA if self.crop_size >= self.obs_out_size else cv2.INTER_LINEAR
 
         ch0 = cv2.resize(crop_gray_u8, (self.obs_out_size, self.obs_out_size), interpolation=interp).astype(np.float32) / 255.0
@@ -372,10 +357,9 @@ class ObsBuilder:
         # 5) meta는 ch0에만
         ch0 = self._inject_meta_pixels_ch0_only(ch0)
 
-        # 6) (4, H, W)
         obs4 = np.stack([ch0, ch1, ch2, ch3], axis=0).astype(np.float32, copy=False)
 
-        # 7) 디버그: bullet_mask만 크게 표시
+        # 7) 디버그: bullet_mask만 크게 표시(네가 원한 형태)
         if self.show_obs_debug:
             try:
                 self._ensure_obs_window()
