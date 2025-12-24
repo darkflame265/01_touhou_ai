@@ -55,6 +55,7 @@ class ObsBuilder:
             prof_every=200,
         )
 
+        # 기본 초기 위치/신뢰도
         self.player_center = (w0 // 2, int(h0 * 0.78))
         self.conf_update_thr = 0.02
 
@@ -64,7 +65,7 @@ class ObsBuilder:
         self.lost_patience_obs = 10
         self._lost_obs = 0
 
-        # 디버그용
+        # 디버그용(원하면 확장)
         self._dbg_last = None
 
         # 정책/리워드용 좌표/신뢰도
@@ -227,7 +228,6 @@ class ObsBuilder:
             pass
         return obs_ch0_01
 
-    # ✅ (복구) 탄 후보 마스크 함수 - 이게 없어서 에러났던 것
     def _compute_bullet_mask_u8(self, crop_bgr: np.ndarray) -> np.ndarray:
         """
         crop_bgr: (crop_size, crop_size, 3) BGR
@@ -249,7 +249,6 @@ class ObsBuilder:
 
         return mask_u8
 
-    # ✅ (정리) risk는 이 “한 개”만 유지 (center_xy 지원)
     def _compute_risk_heat_centered(self, bullet_mask_u8: np.ndarray, center_xy=None) -> np.ndarray:
         """
         bullet_mask_u8: 0/255, 탄 후보 픽셀=255
@@ -295,7 +294,6 @@ class ObsBuilder:
 
         if det is None:
             cx, cy = self.player_center
-            conf = 0.0
             self._dbg_last = None
         else:
             x_n, y_n, conf, logits = det
@@ -328,12 +326,13 @@ class ObsBuilder:
         if self.enable_bullet_channels:
             bullet_mask_u8 = self._compute_bullet_mask_u8(crop_bgr)
 
-            # ✅ 레이무 추정 좌표를 crop 내부 픽셀로 변환해 center로 사용
+            # 레이무 추정 좌표를 crop 내부 픽셀로 변환해 center로 사용
             try:
                 half = 0.5 * float(self.crop_size)
                 if det is None:
                     center_xy = (half, half)
                 else:
+                    # last_xy_norm은 "게이트 적용된 추정치"
                     cx_target, cy_target = self._playfield_norm_to_full_xy(self.last_xy_norm[0], self.last_xy_norm[1])
                     dx = float(cx_target - cx)
                     dy = float(cy_target - cy)
@@ -359,7 +358,7 @@ class ObsBuilder:
 
         obs4 = np.stack([ch0, ch1, ch2, ch3], axis=0).astype(np.float32, copy=False)
 
-        # 7) 디버그: bullet_mask만 크게 표시(네가 원한 형태)
+        # 6) 디버그: bullet_mask만 크게 표시
         if self.show_obs_debug:
             try:
                 self._ensure_obs_window()
