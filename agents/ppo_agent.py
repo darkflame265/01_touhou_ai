@@ -1,4 +1,3 @@
-# agents/ppo_agent.py
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -13,6 +12,10 @@ class PPOAgent:
         self,
         input_channels,
         num_actions,
+
+        # ✅ 추가: 프레임당 obs 채널 수(= ObsBuilder.obs_channels)
+        obs_channels_per_frame=4,
+
         lr=2.5e-4,
         gamma=0.99,
         gae_lambda=0.95,
@@ -22,9 +25,9 @@ class PPOAgent:
         # =========================
         # ✅ 탐색(Entropy) 강화 기본값
         # =========================
-        ent_coef=0.03,        # ✅ 0.02~0.05 추천. (우측 고착이면 0.04도 OK)
-        ent_min=0.01,         # ✅ 0으로 두면 결국 탐색이 완전히 죽어서 고착이 잘 생김
-        ent_decay=0.9999,     # ✅ 0.9995~0.99995 추천. (rollout 256이면 0.9999쯤이 안정적)
+        ent_coef=0.03,
+        ent_min=0.01,
+        ent_decay=0.9999,
 
         rollout_steps=256,
         update_epochs=4,
@@ -35,13 +38,16 @@ class PPOAgent:
         # =========================
         # ✅ 엔트로피 warmup (초반 강제 유지)
         # =========================
-        ent_warmup_updates=50,   # 초반 50회 업데이트 동안 ent_coef를 줄이지 않음
+        ent_warmup_updates=50,
     ):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
         self.model = ActorCriticCNN(
-            input_channels=input_channels,
-            num_actions=num_actions,
+            input_channels=int(input_channels),
+            num_actions=int(num_actions),
+            obs_channels_per_frame=int(obs_channels_per_frame),
+            meta_patch=4,
+            meta_channel_offset=0,
         ).to(self.device)
 
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
@@ -118,7 +124,6 @@ class PPOAgent:
         returns = np.asarray(returns, dtype=np.float32)
         advantages = np.asarray(advantages, dtype=np.float32)
 
-        # 표준화(기존 유지)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         return returns, advantages
 
@@ -127,7 +132,6 @@ class PPOAgent:
             self.reset_buffer()
             return None
 
-        # rollout이 중간에서 끊긴 경우 부트스트랩
         last_value = 0.0
         if (last_state is not None) and (not last_done):
             with torch.no_grad():
@@ -177,7 +181,6 @@ class PPOAgent:
 
                 value_loss = F.mse_loss(values.squeeze(-1), mb_returns)
 
-                # ✅ entropy는 "빼는"게 맞음 (탐색 장려)
                 loss = policy_loss + self.vf_coef * value_loss - self.ent_coef * entropy
 
                 self.optimizer.zero_grad(set_to_none=True)
@@ -191,9 +194,6 @@ class PPOAgent:
                 total_entropy += float(entropy.item())
                 steps += 1
 
-        # =========================
-        # ✅ 엔트로피 decay (warmup 포함)
-        # =========================
         self.update_step += 1
         if self.update_step > self.ent_warmup_updates:
             self.ent_coef = max(self.ent_min, self.ent_coef * self.ent_decay)
@@ -231,13 +231,9 @@ class PPOAgent:
 
         print("[LOAD] partial-load loader active")
 
-        # 1) state_dict 가져오기
         sd = ckpt.get("model", ckpt)
-
-        # 2) 현재 모델의 state_dict
         cur = self.model.state_dict()
 
-        # 3) 호환되는 키만 골라서 로드 (shape까지 일치해야 함)
         filtered = {}
         skipped = []
         for k, v in sd.items():
@@ -246,10 +242,8 @@ class PPOAgent:
             else:
                 skipped.append(k)
 
-        # 4) 부분 로드
         msg = self.model.load_state_dict(filtered, strict=False)
 
-        # 5) 옵티마이저
         if load_optimizer:
             try:
                 if "optimizer" in ckpt:
@@ -257,13 +251,11 @@ class PPOAgent:
             except Exception as e:
                 print(f"[WARN] optimizer state not loaded (model changed): {e}")
 
-        # 6) 카운터/엔트로피 복원(있으면)
         self.global_step = int(ckpt.get("global_step", self.global_step))
         self.update_step = int(ckpt.get("update_step", self.update_step))
         if "ent_coef" in ckpt:
             self.ent_coef = float(ckpt["ent_coef"])
 
-        # 로그
         try:
             print("[LOAD] loaded keys:", len(filtered))
             print("[LOAD] missing keys:", msg.missing_keys)

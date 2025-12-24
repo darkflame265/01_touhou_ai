@@ -83,7 +83,7 @@ class ObsBuilder:
         # -------------------------
         # ✅ "AI가 보는 crop" 디버그
         # -------------------------
-        self.show_obs_debug = False
+        self.show_obs_debug = True
         self.win_crop = "OBS_CROP"
         self._obs_win_inited = False
 

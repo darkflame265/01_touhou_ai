@@ -296,7 +296,8 @@ def main():
     args = parse_args()
     is_eval = bool(args.eval)
 
-    CKPT_PATH = "checkpoints/lunatic_v1.pth"
+    CKPT_PATH = "checkpoints/lunatic_v1_ch4.pth"
+
     os.makedirs(os.path.dirname(CKPT_PATH), exist_ok=True)
 
     pth_name = os.path.splitext(os.path.basename(CKPT_PATH))[0]
@@ -323,6 +324,7 @@ def main():
     agent = PPOAgent(
         input_channels=input_channels,
         num_actions=len(ACTIONS),
+        obs_channels_per_frame=obs_channels,   # ✅ 이거 추가!
     )
 
     # ✅ eval이면 "로드만" 권장, 그래도 파일 있으면 로드하고 없으면 그냥 진행
