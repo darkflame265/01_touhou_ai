@@ -27,8 +27,7 @@ class ActionMasker:
 
     def _action_dir(self, action_enum) -> Tuple[int, int]:
         """
-        actions.py가 'SLOW_...' 이름을 쓰더라도 value는 ["LEFT"], ["UP","RIGHT"] 같이
-        방향키만 들어있다고 가정.
+        value는 ["LEFT"], ["UP","RIGHT"] 같이 방향키만 들어있다고 가정.
         """
         keys = set(action_enum.value)
         dx = (-1 if "LEFT" in keys else (1 if "RIGHT" in keys else 0))
@@ -103,12 +102,21 @@ class ActionMasker:
         return mask
 
     def apply_action_mask(self, action_idx: int, img_bgr):
+        # ✅ 안전장치: idx 범위 밖이면 NONE으로
+        try:
+            ai = int(action_idx)
+        except Exception:
+            ai = 0
+        if not (0 <= ai < len(ACTIONS)):
+            ai = 0
+
         mask = self.get_action_mask(img_bgr)
 
-        if 0 <= int(action_idx) < len(ACTIONS) and bool(mask[int(action_idx)]):
-            return int(action_idx), False, mask
+        # 이미 유효하면 그대로
+        if bool(mask[ai]):
+            return ai, False, mask
 
-        orig = ACTIONS[int(action_idx)]
+        orig = ACTIONS[ai]
         pc = getattr(self.obs, "player_center", None)
 
         flip_x = False

@@ -110,6 +110,21 @@ class ObsBuilder:
         # 안전장치 clip
         self.risk_clip_max = 1.0
 
+        # -------------------------
+        # ✅ 화면 안정화(스무딩)
+        # -------------------------
+        # crop 중심(=player_center) EMA: 0~1, 클수록 "이전 중심을 더 믿음" => 더 부드럽지만 반응 느림
+        self.crop_center_ema_alpha = 0.65
+        self._crop_center_f = None  # (cx_f, cy_f) float
+
+        # risk map EMA: 프레임간 risk 깜빡임 감소
+        self.risk_ema_alpha = 0.60
+        self._prev_risk_crop_01 = None  # (crop_size, crop_size) float32
+
+        # resize 후 약한 블러로 aliasing 완화 (0이면 off)
+        self.post_resize_blur_ksize = 3
+
+
     def reset(self):
         if hasattr(self.det, "reset"):
             self.det.reset()
@@ -122,6 +137,10 @@ class ObsBuilder:
         self._dbg_last = None
 
         self._prev_crop_gray_u8 = None
+
+        self._crop_center_f = None
+        self._prev_risk_crop_01 = None
+
 
     def _ensure_obs_window(self):
         if self._obs_win_inited:
@@ -311,8 +330,23 @@ class ObsBuilder:
 
             self._dbg_last = (float(x_use), float(y_use), float(c_use), logits, str(reason))
 
-        # 2) crop
-        crop_bgr = self._crop_square_bgr(img_bgr, cx, cy, self.crop_size)
+        # 2) crop (✅ 중심 EMA로 안정화)
+        cx_i, cy_i = int(cx), int(cy)
+
+        if self._crop_center_f is None:
+            self._crop_center_f = (float(cx_i), float(cy_i))
+        else:
+            a = float(self.crop_center_ema_alpha)
+            px_f, py_f = self._crop_center_f
+            nx_f = a * px_f + (1.0 - a) * float(cx_i)
+            ny_f = a * py_f + (1.0 - a) * float(cy_i)
+            self._crop_center_f = (nx_f, ny_f)
+
+        cx_s = int(round(self._crop_center_f[0]))
+        cy_s = int(round(self._crop_center_f[1]))
+
+        crop_bgr = self._crop_square_bgr(img_bgr, cx_s, cy_s, self.crop_size)
+
 
         # 3) gray + diff
         crop_gray_u8 = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
@@ -334,13 +368,24 @@ class ObsBuilder:
                 else:
                     # last_xy_norm은 "게이트 적용된 추정치"
                     cx_target, cy_target = self._playfield_norm_to_full_xy(self.last_xy_norm[0], self.last_xy_norm[1])
-                    dx = float(cx_target - cx)
-                    dy = float(cy_target - cy)
+                    dx = float(cx_target - cx_s)
+                    dy = float(cy_target - cy_s)
                     center_xy = (half + dx, half + dy)
+
             except Exception:
                 center_xy = None
 
             risk_crop_01 = self._compute_risk_heat_centered(bullet_mask_u8, center_xy=center_xy)
+            
+            # ✅ risk 프레임간 EMA (깜빡임 감소)
+            if self._prev_risk_crop_01 is None or self._prev_risk_crop_01.shape != risk_crop_01.shape:
+                self._prev_risk_crop_01 = risk_crop_01.astype(np.float32, copy=True)
+            else:
+                a = float(self.risk_ema_alpha)
+                self._prev_risk_crop_01 = (a * self._prev_risk_crop_01 + (1.0 - a) * risk_crop_01).astype(np.float32, copy=False)
+
+            risk_crop_01 = self._prev_risk_crop_01
+
         else:
             bullet_mask_u8 = np.zeros_like(crop_gray_u8, dtype=np.uint8)
             risk_crop_01 = np.zeros((self.crop_size, self.crop_size), dtype=np.float32)
@@ -362,9 +407,13 @@ class ObsBuilder:
         if self.show_obs_debug:
             try:
                 self._ensure_obs_window()
-                vis = cv2.cvtColor(bullet_mask_u8, cv2.COLOR_GRAY2BGR)
+
+                # ch3를 실제 입력과 동일하게 보기 (obs_out_size)
+                dbg = (np.clip(ch3, 0.0, 1.0) * 255.0).astype(np.uint8)
+                vis = cv2.cvtColor(dbg, cv2.COLOR_GRAY2BGR)
                 cv2.imshow(self.win_crop, vis)
                 cv2.waitKey(1)
+
             except Exception:
                 pass
 
