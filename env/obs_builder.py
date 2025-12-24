@@ -63,6 +63,11 @@ class ObsBuilder:
         self.lost_patience_obs = 10
         self._lost_obs = 0
 
+        # ✅ 코너/가장자리 "갑툭튀 점프" 추가 억제
+        self.edge_margin_norm = 0.035          # (0~1) 가장자리 마진
+        self.edge_jump_conf_gain = 3.0         # 가장자리로 점프할 때 필요한 conf 배수(기존 need에 곱)
+        self.edge_jump_min_conf = 0.90         # 가장자리 점프는 최소 이 conf 이상만 고려
+
         self._dbg_last = None
 
         # 정책/리워드용 좌표/신뢰도
@@ -108,19 +113,24 @@ class ObsBuilder:
         self.center_max_speed_px = 10.0
 
         # 선택 옵션: 미세 EMA (0이면 OFF). speed-limit 후에 아주 약하게만 적용 가능.
-        #  - 0.0~0.2 정도 추천. (0이면 완전 OFF)
         self.center_micro_ema_alpha = 0.0
 
         self._crop_center_f = None  # (cx_f, cy_f) float
 
         # (B) risk 안정화: "max-hold + decay"
-        #  - 위험도 증가: 즉시 반영(딜레이 거의 없음)
-        #  - 위험도 감소: decay로 천천히 내려가 깜빡임 감소
         self.risk_decay = 0.70
         self._risk_hold_crop_01 = None  # (crop_size, crop_size) float32
 
         # resize 후 약한 블러로 aliasing 완화 (0이면 off, 3 또는 5 추천)
         self.post_resize_blur_ksize = 0
+
+        # ✅ (핵심) crop이 화면 밖으로 나가며 "거울 코너" 패턴 생기는 걸 원천 차단
+        #  - True면 cx_s/cy_s를 항상 화면 안쪽으로 clamp → padding 자체가 거의 발생 안 함
+        self.clamp_crop_inside = True
+
+        # ✅ 혹시라도 padding이 생기면, 그 영역(거울/패딩)이 입력에서 과신호가 되지 않게 마스크 적용
+        self.enable_valid_mask = True
+        self.valid_mask_soft_blur = 7  # 0이면 off, 홀수 권장(5~11)
 
     def reset(self):
         if hasattr(self.det, "reset"):
@@ -148,7 +158,35 @@ class ObsBuilder:
             pass
         self._obs_win_inited = True
 
-    def _crop_square_bgr(self, img_bgr, cx, cy, size):
+    @staticmethod
+    def _is_near_edge(x_n: float, y_n: float, m: float) -> bool:
+        return (x_n <= m) or (x_n >= 1.0 - m) or (y_n <= m) or (y_n >= 1.0 - m)
+
+    def _clamp_crop_center(self, cx: int, cy: int, size: int) -> tuple[int, int]:
+        """crop가 화면 밖으로 나가 padding/거울이 생기지 않도록 중심을 clamp"""
+        h, w = self.H, self.W
+        half = int(size) // 2
+
+        # size가 화면보다 큰 경우 방어
+        if half <= 0:
+            return int(cx), int(cy)
+
+        # 중심이 가질 수 있는 범위: [half, w-half-1], [half, h-half-1]
+        cx_min = half
+        cx_max = max(half, w - half - 1)
+        cy_min = half
+        cy_max = max(half, h - half - 1)
+
+        cx_c = int(np.clip(cx, cx_min, cx_max))
+        cy_c = int(np.clip(cy, cy_min, cy_max))
+        return cx_c, cy_c
+
+    def _crop_square_bgr_with_mask(self, img_bgr, cx, cy, size):
+        """
+        crop과 함께:
+          - valid_mask_u8: 실제 화면에서 온 픽셀=255, padding=0 (size x size)
+        를 리턴.
+        """
         h, w = img_bgr.shape[:2]
         size = int(size)
         half = size // 2
@@ -158,9 +196,13 @@ class ObsBuilder:
         x2 = x1 + size
         y2 = y1 + size
 
+        # 완전히 화면 안
         if (0 <= x1) and (0 <= y1) and (x2 <= w) and (y2 <= h):
-            return img_bgr[y1:y2, x1:x2]
+            crop = img_bgr[y1:y2, x1:x2]
+            valid = np.full((size, size), 255, dtype=np.uint8)
+            return crop, valid
 
+        # padding 발생 (clamp를 켜면 이 케이스가 거의 사라짐)
         pad_l = max(0, -x1)
         pad_t = max(0, -y1)
         pad_r = max(0, x2 - w)
@@ -170,15 +212,25 @@ class ObsBuilder:
             img_bgr, pad_t, pad_b, pad_l, pad_r, borderType=cv2.BORDER_REFLECT_101
         )
 
-        x1 += pad_l
-        y1 += pad_t
-        x2 += pad_l
-        y2 += pad_t
+        base_valid = np.full((h, w), 255, dtype=np.uint8)
+        valid_pad = cv2.copyMakeBorder(
+            base_valid, pad_t, pad_b, pad_l, pad_r, borderType=cv2.BORDER_CONSTANT, value=0
+        )
 
-        crop = img_pad[y1:y2, x1:x2]
+        x1p = x1 + pad_l
+        y1p = y1 + pad_t
+        x2p = x2 + pad_l
+        y2p = y2 + pad_t
+
+        crop = img_pad[y1p:y2p, x1p:x2p]
+        valid = valid_pad[y1p:y2p, x1p:x2p]
+
         if crop.shape[0] != size or crop.shape[1] != size:
             crop = cv2.resize(crop, (size, size), interpolation=cv2.INTER_LINEAR)
-        return crop
+        if valid.shape[0] != size or valid.shape[1] != size:
+            valid = cv2.resize(valid, (size, size), interpolation=cv2.INTER_NEAREST)
+
+        return crop, valid
 
     def _playfield_norm_to_full_xy(self, x_n: float, y_n: float) -> tuple[int, int]:
         cx = int(np.clip(x_n * self._playfield_w, 0, self._playfield_w - 1))
@@ -199,6 +251,7 @@ class ObsBuilder:
         y_n = float(np.clip(y_n, 0.0, 1.0))
         conf = float(conf)
 
+        # 1) 너무 낮은 conf는 기본 홀드
         if conf < float(self.conf_update_thr):
             self._lost_obs += 1
             if self._lost_obs >= int(self.lost_patience_obs):
@@ -207,8 +260,28 @@ class ObsBuilder:
             return (float(prev_xy[0]), float(prev_xy[1]), float(prev_c), False, "LOWCONF_HOLD")
 
         d = self._dist_norm((x_n, y_n), prev_xy)
+
+        # 2) 점프면: 기본 need 기준으로 accept/reject
         if d > float(self.max_jump_norm_obs):
             need = max(1e-6, prev_c) * float(self.jump_allow_conf_gain_obs)
+
+            # ✅ "가장자리/코너로 갑자기 점프"는 더 빡세게
+            m = float(self.edge_margin_norm)
+            prev_edge = self._is_near_edge(float(prev_xy[0]), float(prev_xy[1]), m)
+            now_edge = self._is_near_edge(x_n, y_n, m)
+
+            if (now_edge and (not prev_edge)):
+                need = need * float(self.edge_jump_conf_gain)
+                if conf < float(self.edge_jump_min_conf):
+                    self._lost_obs += 1
+                    if self._lost_obs >= int(self.lost_patience_obs):
+                        # ✅ 여기서 "가장자리로 FORCE"를 해버리면,
+                        #   코너 가짜패턴(거울)과 결합해서 lock이 코너로 빨려들기 쉬움.
+                        #   그래서 FORCE_EDGE_JUMP 대신 FORCE_JUMP(일반)로만 처리.
+                        self._lost_obs = 0
+                        return (float(prev_xy[0]), float(prev_xy[1]), float(prev_c), True, "FORCE_EDGE_HOLD")
+                    return (float(prev_xy[0]), float(prev_xy[1]), float(prev_c), False, "EDGE_JUMP_REJECT")
+
             if conf >= need:
                 self._lost_obs = 0
                 return (x_n, y_n, conf, True, "JUMP_ACCEPT")
@@ -346,7 +419,23 @@ class ObsBuilder:
         cx_s = int(round(self._crop_center_f[0]))
         cy_s = int(round(self._crop_center_f[1]))
 
-        crop_bgr = self._crop_square_bgr(img_bgr, cx_s, cy_s, self.crop_size)
+        # ✅ (핵심) crop이 화면 밖으로 나가서 거울/코너 패턴 생기지 않도록 clamp
+        if self.clamp_crop_inside:
+            cx_s, cy_s = self._clamp_crop_center(cx_s, cy_s, self.crop_size)
+            # clamp 후 center_f도 같이 맞춰줘서 "다음 프레임에 다시 밖으로 밀리는" 현상 방지
+            self._crop_center_f = (float(cx_s), float(cy_s))
+
+        crop_bgr, valid_u8 = self._crop_square_bgr_with_mask(img_bgr, cx_s, cy_s, self.crop_size)
+
+        # ✅ valid mask (0..1), soft blur 옵션
+        if self.enable_valid_mask:
+            valid01 = (valid_u8.astype(np.float32) / 255.0)
+            k = int(self.valid_mask_soft_blur)
+            if k and k >= 3 and (k % 2 == 1):
+                valid01 = cv2.GaussianBlur(valid01, (k, k), 0)
+            valid01 = np.clip(valid01, 0.0, 1.0).astype(np.float32, copy=False)
+        else:
+            valid01 = None
 
         # 3) gray + diff
         crop_gray_u8 = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
@@ -385,6 +474,14 @@ class ObsBuilder:
         else:
             bullet_mask_u8 = np.zeros((self.crop_size, self.crop_size), dtype=np.uint8)
             risk_crop_01 = np.zeros((self.crop_size, self.crop_size), dtype=np.float32)
+
+        # ✅ padding(거울) 영역이 입력에서 과신호가 되지 않도록 마스크 적용
+        if valid01 is not None:
+            # uint8에 바로 곱하면 경계가 너무 날카로울 수 있어서 float로 처리 후 복원
+            crop_gray_u8 = np.clip(crop_gray_u8.astype(np.float32) * valid01, 0, 255).astype(np.uint8)
+            diff_u8 = np.clip(diff_u8.astype(np.float32) * valid01, 0, 255).astype(np.uint8)
+            bullet_mask_u8 = np.clip(bullet_mask_u8.astype(np.float32) * valid01, 0, 255).astype(np.uint8)
+            risk_crop_01 = (risk_crop_01.astype(np.float32) * valid01).astype(np.float32)
 
         # 4) resize
         interp = cv2.INTER_AREA if self.crop_size >= self.obs_out_size else cv2.INTER_LINEAR
