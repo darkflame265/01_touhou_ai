@@ -87,8 +87,8 @@ class ObsBuilder:
         self.win_crop = "OBS_CROP"
         self._obs_win_inited = False
 
-        self._obs_win_pos = (2350, 60)
-        self._obs_win_size = (520, 520)
+        self._obs_win_pos = (1600, 60)
+        self._obs_win_size = (600, 600)
 
         self.last_crop_gray_u8 = None
         self._prev_crop_gray_u8 = None
@@ -100,10 +100,10 @@ class ObsBuilder:
 
         # (1) HSV 기반 탄 후보: 밝고(s/v) 채도(s) 높은 픽셀을 탄 후보로 간주
         #    ※ 루나틱 탄막은 보통 채도/밝기가 높아서 이게 꽤 먹힘.
-        self.bullet_hsv_s_min = 80     # 채도 하한
-        self.bullet_hsv_v_min = 160    # 밝기 하한
+        self.bullet_hsv_s_min = 40     # 채도 하한
+        self.bullet_hsv_v_min = 140    # 밝기 하한
         self.bullet_hsv_v_max = 255
-        self.bullet_close_morph = 1    # 0이면 off, 1~2 추천 (노이즈 정리)
+        self.bullet_close_morph = 0   # 0이면 off, 1~2 추천 (노이즈 정리)
 
         # (2) 위험도 변환 파라미터
         # distTransform 결과(dist 픽셀)를 tau로 나눠 exp(-dist/tau)
@@ -370,19 +370,15 @@ class ObsBuilder:
             try:
                 self._ensure_obs_window()
 
-                # 보기 좋게 3분할(그레이 / 마스크 / 리스크)
-                g = crop_gray_u8
+                # === OBS_CROP: 가운데 화면만 크게 표시 ===
                 m = bullet_mask_u8
-                r = (np.clip(risk_crop_01, 0.0, 1.0) * 255.0).astype(np.uint8)
 
-                # 3채널로 맞춰서 concat
-                g3 = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
-                m3 = cv2.cvtColor(m, cv2.COLOR_GRAY2BGR)
-                r3 = cv2.cvtColor(r, cv2.COLOR_GRAY2BGR)
+                # 보기 좋게 BGR로 변환
+                vis = cv2.cvtColor(m, cv2.COLOR_GRAY2BGR)
 
-                vis = np.concatenate([g3, m3, r3], axis=1)
                 cv2.imshow(self.win_crop, vis)
                 cv2.waitKey(1)
+
             except Exception:
                 pass
 
