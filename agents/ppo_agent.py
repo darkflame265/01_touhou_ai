@@ -18,50 +18,58 @@ class PPOAgent:
     ✅ 또한 main_ppo.py가 예전 인자(two_stream 등)를 넘겨도 죽지 않게 **kwargs 흡수
     """
 
+    # agents/ppo_agent.py (PPOAgent.__init__ 시그니처에 추가)
     def __init__(
         self,
         input_channels,
         num_actions,
-
-        # ✅ 2-stream: 프레임당 8채널(=ObsBuilder.obs_channels)
         obs_channels_per_frame=8,
+
+        # ✅ 추가: main에서 실측한 g_ch / l_ch를 받는다
+        global_channels=4,
+        local_channels=4,
 
         lr=3.0e-4,
         gamma=0.99,
         gae_lambda=0.95,
-
         clip_eps=0.15,
         vf_coef=0.5,
-
         ent_coef=0.04,
         ent_min=0.005,
         ent_decay=0.9995,
-
         rollout_steps=128,
         update_epochs=5,
         mini_batch_size=64,
-
         device=None,
         max_grad_norm=0.5,
-
         ent_warmup_updates=30,
-
-        # ✅ 예전 코드 호환(넘어와도 무시)
         **kwargs,
     ):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        # ✅ 여기서 assert를 "모델 내부"가 아니라 "agent 쪽"에서 먼저 터뜨려서 원인 바로 보이게
+        if int(global_channels) + int(local_channels) != int(obs_channels_per_frame):
+            raise ValueError(
+                f"Channel mismatch: global_channels({global_channels}) + local_channels({local_channels}) "
+                f"!= obs_channels_per_frame({obs_channels_per_frame}). "
+                f"Fix main_ppo.py or PPOAgent init args."
+            )
 
         self.model = TwoStreamActorCriticCNN(
             input_channels=int(input_channels),
             num_actions=int(num_actions),
             obs_channels_per_frame=int(obs_channels_per_frame),
-            global_channels=4,
-            local_channels=4,
+
+            # ✅ 하드코딩 제거하고 전달값 사용
+            global_channels=int(global_channels),
+            local_channels=int(local_channels),
+
             meta_patch=4,
-            meta_local_channel_offset=0,  # local ch0
+            meta_local_channel_offset=0,
         ).to(self.device)
 
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=float(lr))
+
 
         # ✅ (중요) GAE에 쓰는 gamma 누락 수정
         self.gamma = float(gamma)

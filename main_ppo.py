@@ -400,25 +400,44 @@ def main():
 
                     # PPOAgent가 two_stream 모델을 지원하도록 네가 이미 수정했다는 가정:
                     #  - PPOAgent(..., two_stream=True, global_channels=g_ch, local_channels=l_ch)
+                    
                     agent = PPOAgent(
-                        input_channels=(g_ch + l_ch),          # (참고용) 내부에서 안 쓰면 무시해도 됨
+                        input_channels=8,          # (참고용) 내부에서 안 쓰면 무시해도 됨
                         num_actions=len(ACTIONS),
-                        obs_channels_per_frame=int(getattr(env.obs, "obs_channels", 4)),
-                        two_stream=True,
+                        obs_channels_per_frame=8,
                         global_channels=g_ch,
                         local_channels=l_ch,
                     )
                 else:
-                    obs_channels = int(getattr(env.obs, "obs_channels", 1))
-                    input_channels = obs_channels * stack_size
-                    print(f"[PPO] detected SINGLE state | input_channels={input_channels} (obs={obs_channels}*stack={stack_size})")
+                    # ✅ state shape에서 직접 채널 계산 (env.obs.obs_channels 믿지 않기)
+                    stack_size = int(getattr(env.s, "frame_stack_size", 4))
+
+                    # state: (C,H,W) 라고 가정
+                    input_channels = int(state.shape[0])
+                    obs_channels_per_frame = input_channels // stack_size
+
+                    print(
+                        f"[PPO] detected SINGLE state | input_channels={input_channels} "
+                        f"(C={input_channels} = per_frame={obs_channels_per_frame} * stack={stack_size})"
+                    )
+
+                    # ✅ 네가 '8채널/프레임'을 쓸 거라면 여기서 강제 체크
+                    if obs_channels_per_frame != 8:
+                        raise ValueError(
+                            f"[FATAL] ObsBuilder output mismatch: per_frame_channels={obs_channels_per_frame} (expected 8). "
+                            f"state.shape={tuple(state.shape)} stack={stack_size}. "
+                            f"→ ObsBuilder가 프레임당 8채널을 내도록 먼저 고쳐야 함."
+                        )
 
                     agent = PPOAgent(
-                        input_channels=input_channels,
+                        input_channels=input_channels,     # = 8*stack
                         num_actions=len(ACTIONS),
-                        obs_channels_per_frame=obs_channels,
-                        two_stream=False,
+                        obs_channels_per_frame=8,          # ✅ 4+4=8 맞춰줌
+                        global_channels=4,
+                        local_channels=4,
+                        # two_stream 인자는 어차피 **kwargs로 무시되니 빼도 됨
                     )
+
 
                 # 체크포인트 로드
                 if os.path.exists(CKPT_PATH):
