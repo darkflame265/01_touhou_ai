@@ -14,14 +14,11 @@ class ReimuDetector:
       (x_norm, y_norm, conf, logits)
 
     ✅ 목표(이번 완성본):
-    - 보스 등장(사람 비슷한 2개) 때 크롭이 보스로 튀는 현상 억제
-      1) y-gate(상단 후보 억제/제외)
-      2) 단일 argmax 대신 Top-K 후보에서 "레이무스러움" 스코어로 선택
-      3) lock 상태에서 "위쪽 점프"는 더 엄격하게 차단
+    - 보스 등장/이펙트 변화 때 "잠깐" 강한 peak가 생겨도 lock이 즉시 갈아타지 않게
+      => "Switch-stability gate" (N프레임 연속일 때만 lock 전환)
 
-    ✅ 성능 최적화 포인트(유지):
-    - 고정 numpy 버퍼로 stack 관리
-    - torch 텐서 생성 최소화 (CUDA prealloc + copy_)
+    ✅ 유지:
+    - numpy 고정 버퍼 stack
     - torch.inference_mode()
     - (옵션) CUDA FP16
     - (옵션) track_prior_every
@@ -44,26 +41,32 @@ class ReimuDetector:
         jump_allow_conf_gain=2.6,
         lost_patience=16,
 
-        # ===== ✅ 보스 튐 방지(핵심) =====
-        # y가 너무 위(작음)면 후보에서 제외/패널티
-        y_gate_min=0.40,               # 0.35~0.45 추천 (기본 0.40)
-        y_gate_softness=0.06,          # gate 경계 부드럽게(패널티 곡선 폭)
+        # ===== 보스 튐 방지(기존) =====
+        y_gate_min=0.40,
+        y_gate_softness=0.06,
 
-        # Top-K 후보 선택
-        topk=8,                        # 5~10 추천
-        cand_use_softmax=True,         # 후보 신뢰도 = softmax(beta*logits) 기반
-        cand_prior_w=2.2,              # lock 근처 보너스 가중치
-        cand_bottom_w=0.8,             # 아래쪽 선호(큰 y) 가중치
-        cand_jump_w=1.6,               # lock에서 멀어질수록 패널티 가중치
-        cand_prior_sigma=0.10,         # 후보 선택에서 prior 폭 (track_prior_sigma보다 약간 넓게 추천)
+        topk=8,
+        cand_use_softmax=True,
+        cand_prior_w=2.2,
+        cand_bottom_w=0.8,
+        cand_jump_w=1.6,
+        cand_prior_sigma=0.10,
 
-        # "위쪽 점프"만 추가로 더 엄격하게
-        upjump_extra_gain=1.7,         # 위로 튀는 점프는 allow_thr *= upjump_extra_gain
-        upjump_margin=0.04,            # (prev_y - new_y) > margin 이면 "위쪽 점프"로 간주
+        upjump_extra_gain=1.7,
+        upjump_margin=0.04,
+
+        # ===== ✅ NEW: lock "전환" 안정화 게이트 =====
+        # 멀리 점프해서 lock을 바꾸려면, 같은 방향의 후보가 N프레임 연속으로
+        # 충분히 강한 근거(conf/score)를 보여야만 전환한다.
+        switch_patience=6,              # 4~10 추천. (보스 등장 순간 튐이면 6~8이 안정적)
+        switch_min_conf=0.55,           # switch 후보의 최소 conf (너무 낮으면 카운트 안 쌓음)
+        switch_score_margin=0.10,       # 현재 lock 근처 best_score 대비 얼마나 좋아야 카운트 인정할지
+        switch_min_dist=0.22,           # lock과 이 정도 이상 멀면 "switch 후보"로 간주(너무 가까우면 그냥 update)
+        switch_decay=0.70,              # switch 후보가 끊기면 count를 얼마나 유지할지(0~1, 낮을수록 빨리 리셋)
 
         # ===== 성능 옵션 =====
-        use_fp16=True,                 # CUDA에서만 의미
-        track_prior_every=1,           # 1=매프레임, 2=2프레임마다...
+        use_fp16=True,
+        track_prior_every=1,
         print_prof=True,
         prof_every=200,
     ):
@@ -91,6 +94,13 @@ class ReimuDetector:
         self.cand_prior_sigma = float(cand_prior_sigma)
         self.upjump_extra_gain = float(upjump_extra_gain)
         self.upjump_margin = float(upjump_margin)
+
+        # ---- NEW: switch gate ----
+        self.switch_patience = int(max(1, switch_patience))
+        self.switch_min_conf = float(switch_min_conf)
+        self.switch_score_margin = float(switch_score_margin)
+        self.switch_min_dist = float(switch_min_dist)
+        self.switch_decay = float(np.clip(switch_decay, 0.0, 1.0))
 
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.use_fp16 = bool(use_fp16 and (self.device.type == "cuda"))
@@ -135,6 +145,11 @@ class ReimuDetector:
         self._lock_conf = 0.0
         self._lost_count = 0
 
+        # NEW: switch 후보 누적 상태
+        self._sw_xy = None
+        self._sw_count = 0.0
+        self._sw_best_score = None
+
         # mesh cache
         self._yy = None
         self._xx = None
@@ -142,13 +157,13 @@ class ReimuDetector:
         # debug
         self.last_raw_xy = None
         self.last_lock_xy = None
-        self.last_cands = None  # [(x,y,cand_conf,score), ...]
+        self.last_cands = None
 
         self._step_i = 0
         print(
             f"[DET] device={self.device} fp16={self.use_fp16} "
             f"track_prior_every={self.track_prior_every} stack={self.stack} out={self.out_w}x{self.out_h} "
-            f"y_gate_min={self.y_gate_min:.2f} topk={self.topk}"
+            f"y_gate_min={self.y_gate_min:.2f} topk={self.topk} switch_patience={self.switch_patience}"
         )
 
     def reset(self):
@@ -158,6 +173,11 @@ class ReimuDetector:
         self._lock_xy = None
         self._lock_conf = 0.0
         self._lost_count = 0
+
+        self._sw_xy = None
+        self._sw_count = 0.0
+        self._sw_best_score = None
+
         self.last_raw_xy = None
         self.last_lock_xy = None
         self.last_cands = None
@@ -167,6 +187,10 @@ class ReimuDetector:
         self._lock_xy = None
         self._lock_conf = 0.0
         self._lost_count = 0
+
+        self._sw_xy = None
+        self._sw_count = 0.0
+        self._sw_best_score = None
 
     def _apply_bottom_prior(self, logits: torch.Tensor) -> torch.Tensor:
         if self.prior_strength <= 0:
@@ -228,38 +252,27 @@ class ReimuDetector:
         return self._x_cuda
 
     def _y_gate_penalty(self, y_norm: float) -> float:
-        """
-        y가 y_gate_min보다 위(작음)면 점수를 깎는다.
-        softness로 경계를 부드럽게(선형/리니어) 처리.
-        반환: 0(패널티 없음) ~ 1(최대 패널티)
-        """
         yg = self.y_gate_min
         s = max(1e-6, self.y_gate_softness)
         if y_norm >= yg:
             return 0.0
-        # yg - s 아래로 갈수록 1.0에 수렴
         t = (yg - y_norm) / s
         return float(np.clip(t, 0.0, 1.0))
 
     def _pick_from_topk(self, logits: torch.Tensor):
         """
-        logits: (1,1,H,W)
         return: (x_norm, y_norm, cand_conf, score, (ix,iy))
         """
         hm = logits[0, 0]  # (H,W)
         H, W = hm.shape[-2], hm.shape[-1]
 
-        # 후보 "신뢰도"를 softmax(beta*logits)로 만들면, 보스처럼 peak가 강한 경우에도
-        # lock/bottom/prior로 상쇄 가능하고, conf 스케일이 안정적.
         if self.cand_use_softmax:
             flat = (hm * float(self.beta)).reshape(-1)
             prob = torch.softmax(flat, dim=0).reshape(H, W)
             score_base = prob
         else:
-            # 그냥 logits 자체를 base로 쓰는 옵션(기본은 softmax 추천)
             score_base = hm
 
-        # topk indices
         flat2 = score_base.reshape(-1)
         k = min(self.topk, flat2.numel())
         vals, idxs = torch.topk(flat2, k=k, largest=True, sorted=True)
@@ -282,11 +295,9 @@ class ReimuDetector:
             x = (ix + 0.5) / float(W)
             y = (iy + 0.5) / float(H)
 
-            # y gate(상단 억제)
-            gate = self._y_gate_penalty(y)  # 0..1
-            gate_mul = 1.0 - gate  # 1..0
+            gate = self._y_gate_penalty(y)
+            gate_mul = 1.0 - gate
 
-            # lock prior / jump cost
             if lock_xy is None:
                 prior_bonus = 0.0
                 jump_cost = 0.0
@@ -297,41 +308,88 @@ class ReimuDetector:
                 prior_bonus = float(np.exp(-0.5 * d2 / sigma2))
                 jump_cost = float(np.sqrt(d2))
 
-            # bottom bonus: y가 클수록(아래) 보너스
             bottom_bonus = y
 
-            # 최종 score
             score = (v * gate_mul) + (self.cand_prior_w * prior_bonus) + (self.cand_bottom_w * bottom_bonus) - (
                 self.cand_jump_w * jump_cost
             )
 
             cand_list.append((x, y, v, score))
-
             if (best is None) or (score > best[3]):
                 best = (x, y, v, score, (ix, iy))
 
-        # 디버그용 저장
         self.last_cands = cand_list
         return best
+
+    def _switch_gate_update(self, x_new: float, y_new: float, conf: float, best_score: float) -> bool:
+        """
+        멀리 점프하여 lock을 갈아타려는 경우,
+        - switch 후보를 누적하고
+        - N프레임 연속으로 조건을 만족하면 True(전환 허용)
+        """
+        if self._lock_xy is None:
+            self._sw_xy = None
+            self._sw_count = 0.0
+            self._sw_best_score = None
+            return True
+
+        lockx, locky = float(self._lock_xy[0]), float(self._lock_xy[1])
+        d = self._dist((x_new, y_new), (lockx, locky))
+
+        # 가까우면 switch가 아니라 그냥 update 흐름
+        if d < self.switch_min_dist:
+            self._sw_xy = None
+            self._sw_count = 0.0
+            self._sw_best_score = None
+            return True
+
+        # conf/score 조건이 약하면 카운트 쌓지 말고 감쇠
+        if conf < self.switch_min_conf:
+            self._sw_count *= self.switch_decay
+            if self._sw_count < 0.5:
+                self._sw_xy = None
+                self._sw_best_score = None
+            return False
+
+        # "현재 lock 근처" 후보 대비 score가 충분히 좋아야 카운트 인정
+        # (best_score는 pick 후보 score. lock 근처로 고정되어 있을 땐 이 점수가 튈 때가 있어 margin으로 필터)
+        if self._sw_best_score is None:
+            self._sw_best_score = float(best_score)
+
+        # 후보가 자주 바뀌면(서로 다른 방향) 카운트가 의미 없으니, 위치가 크게 달라지면 리셋
+        if self._sw_xy is None:
+            self._sw_xy = (float(x_new), float(y_new))
+            self._sw_count = 1.0
+            self._sw_best_score = float(best_score)
+        else:
+            sd = self._dist((x_new, y_new), self._sw_xy)
+            if sd > 0.10:
+                # switch 후보 방향이 바뀜 => 다시 쌓기
+                self._sw_xy = (float(x_new), float(y_new))
+                self._sw_count = 1.0
+                self._sw_best_score = float(best_score)
+            else:
+                # 같은 방향 => 카운트 증가 (score가 더 좋아지면 갱신)
+                if (best_score + self.switch_score_margin) >= self._sw_best_score:
+                    self._sw_count += 1.0
+                    self._sw_best_score = max(self._sw_best_score, float(best_score))
+                else:
+                    # 살짝 약해지면 감쇠
+                    self._sw_count *= self.switch_decay
+
+        return self._sw_count >= float(self.switch_patience)
 
     def step(self, img_bgr):
         """
         Returns:
           None (warmup)
           or (x_norm, y_norm, conf, logits)
-
-        NOTE:
-        - conf는 기본적으로 soft_argmax_2d의 conf를 유지(기존 호환)
-        - lock 좌표는 Top-K 후보 선택 결과(EMA 포함)로 업데이트
         """
         self._step_i += 1
         t0 = time.perf_counter()
 
-        # -------------------------
-        # (DEBUG 옵션)
-        # -------------------------
-        dbg_on = bool(getattr(self, "track_debug", True))
-        dbg_every = int(getattr(self, "track_debug_every", 60))
+        dbg_on = bool(getattr(self, "track_debug", False))
+        dbg_every = int(getattr(self, "track_debug_every", 200))
         if not hasattr(self, "_dbg_i"):
             self._dbg_i = 0
         self._dbg_i += 1
@@ -343,33 +401,25 @@ class ReimuDetector:
                 return
             print(msg)
 
-        # -------------------------
         # 1) playfield gray + resize + normalize
-        # -------------------------
         play = self.screen.get_playfield_gray(img_bgr)
         small = cv2.resize(play, (self.out_w, self.out_h), interpolation=cv2.INTER_AREA)
         small = small.astype(np.float32) * (1.0 / 255.0)
         t1 = time.perf_counter()
 
-        # -------------------------
         # 2) stack buffer push
-        # -------------------------
         self._push_frame(small)
         if self._buf_len < self.stack:
             return None
         t2 = time.perf_counter()
 
-        # -------------------------
         # 3) input tensor
-        # -------------------------
         x = self._make_input_tensor()
         if self.device.type == "cuda" and not self.use_fp16:
             x = x.float()
         t3 = time.perf_counter()
 
-        # -------------------------
         # 4) forward
-        # -------------------------
         with torch.inference_mode():
             logits = self.model(x)  # (1,1,H,W)
             logits = self._apply_bottom_prior(logits)
@@ -377,43 +427,36 @@ class ReimuDetector:
             if (self.track_prior_every == 1) or ((self._step_i % self.track_prior_every) == 0):
                 logits = self._apply_track_prior(logits)
 
-            # soft-argmax(기존 conf 유지)
             xy_sa, conf_sa = soft_argmax_2d(logits, beta=self.beta)
-
-            # ✅ Top-K 후보 중 선택(보스 튐 방지 핵심)
             best = self._pick_from_topk(logits)
         t4 = time.perf_counter()
 
-        # -------------------------
         # 5) to python float
-        # -------------------------
-        # raw는 soft-argmax 결과(기존 디버그/호환)
         x_raw = float(np.clip(float(xy_sa[0, 0].item()), 0.0, 1.0))
         y_raw = float(np.clip(float(xy_sa[0, 1].item()), 0.0, 1.0))
         c = float(conf_sa[0, 0].item())
-
         self.last_raw_xy = (x_raw, y_raw)
 
-        # best 후보 좌표
         if best is None:
-            # 방어 코드(거의 발생 X)
             x_pick, y_pick = x_raw, y_raw
             cand_conf, cand_score = c, 0.0
         else:
             x_pick, y_pick, cand_conf, cand_score, _ = best
 
-        # EMA는 pick 좌표에 적용(레이무 추적 안정화)
+        # EMA는 pick 좌표에 적용
         x_n, y_n = self._ema(float(x_pick), float(y_pick))
         x_n = float(np.clip(x_n, 0.0, 1.0))
         y_n = float(np.clip(y_n, 0.0, 1.0))
-
         cur = np.array([x_n, y_n], dtype=np.float32)
 
         # =========================================================
         # lock / gating
         # =========================================================
-        # (A) lock 없음: conf가 충분할 때만 lock
         if self._lock_xy is None:
+            self._sw_xy = None
+            self._sw_count = 0.0
+            self._sw_best_score = None
+
             if c >= self.lock_conf_thr:
                 self._lock_xy = cur.copy()
                 self._lock_conf = c
@@ -427,17 +470,15 @@ class ReimuDetector:
                     )
             else:
                 _dbg(
-                    f"[DET][NO_LOCK] step={self._step_i} "
-                    f"pick=({x_pick:.3f},{y_pick:.3f}) ema=({x_n:.3f},{y_n:.3f}) "
-                    f"confSA={c:.4f} < thr={self.lock_conf_thr:.4f}"
+                    f"[DET][NO_LOCK] step={self._step_i} pick=({x_pick:.3f},{y_pick:.3f}) "
+                    f"ema=({x_n:.3f},{y_n:.3f}) confSA={c:.4f} < thr={self.lock_conf_thr:.4f}"
                 )
-            # 반환은 현재 추정(EMA) + SA conf + logits (기존 호환)
             return x_n, y_n, c, logits
 
-        # (B) lock 있음
+        # lock 있음
         d = self._dist(cur, self._lock_xy)
 
-        # (B1) conf 낮으면: lock 유지(일정 patience)
+        # conf 낮으면 유지
         if c < self.lock_conf_thr:
             self._lost_count += 1
             if dbg_on:
@@ -450,40 +491,63 @@ class ReimuDetector:
 
             if self._lost_count >= self.lost_patience:
                 if dbg_on:
-                    print(
-                        f"[DET][LOCK_DROP_BY_LOST] step={self._step_i} "
-                        f"lost={self._lost_count}/{self.lost_patience} confSA={c:.4f}"
-                    )
+                    print(f"[DET][LOCK_DROP_BY_LOST] step={self._step_i} lost={self._lost_count}/{self.lost_patience} confSA={c:.4f}")
                 self._lock_xy = None
                 self._lock_conf = 0.0
                 self._lost_count = 0
                 return x_n, y_n, c, logits
 
-            # lock 유지(반환 좌표는 lock)
             return float(self._lock_xy[0]), float(self._lock_xy[1]), c, logits
 
-        # (B2) 점프 거리 초과면: 매우 높은 conf일 때만 점프 허용
+        # 점프 거리 초과
         if d > self.max_jump_norm:
             allow_thr = float(self._lock_conf * self.jump_allow_conf_gain)
 
-            # ✅ 위쪽 점프는 더 엄격히
             prev_y = float(self._lock_xy[1])
             if (prev_y - y_n) > self.upjump_margin:
                 allow_thr *= self.upjump_extra_gain
 
+            # ✅ NEW: switch-stability gate
+            # "즉시 갈아타기" 대신, N프레임 연속으로 확신일 때만 갈아탄다.
             if c >= allow_thr:
-                if dbg_on:
-                    print(
-                        f"[DET][JUMP_ACCEPT] step={self._step_i} d={d:.4f} > max_jump={self.max_jump_norm:.4f} "
-                        f"confSA={c:.4f} >= allow_thr={allow_thr:.4f} "
-                        f"lock_conf={self._lock_conf:.4f} gain={self.jump_allow_conf_gain:.2f} "
-                        f"new_lock=({x_n:.3f},{y_n:.3f}) old_lock=({float(self._lock_xy[0]):.3f},{float(self._lock_xy[1]):.3f})"
-                    )
-                self._lock_xy = cur.copy()
-                self._lock_conf = c
-                self._lost_count = 0
-                return x_n, y_n, c, logits
+                ok_switch = self._switch_gate_update(x_n, y_n, c, float(cand_score))
+                if ok_switch:
+                    if dbg_on:
+                        print(
+                            f"[DET][SWITCH_ACCEPT] step={self._step_i} d={d:.4f} confSA={c:.4f} >= allow_thr={allow_thr:.4f} "
+                            f"sw_count={self._sw_count:.1f}/{self.switch_patience} new_lock=({x_n:.3f},{y_n:.3f}) "
+                            f"old_lock=({float(self._lock_xy[0]):.3f},{float(self._lock_xy[1]):.3f})"
+                        )
+                    self._lock_xy = cur.copy()
+                    self._lock_conf = c
+                    self._lost_count = 0
+                    self._sw_xy = None
+                    self._sw_count = 0.0
+                    self._sw_best_score = None
+                    return x_n, y_n, c, logits
+                else:
+                    self._lost_count += 1
+                    if dbg_on:
+                        print(
+                            f"[DET][SWITCH_HOLD] step={self._step_i} d={d:.4f} confSA={c:.4f} >= allow_thr={allow_thr:.4f} "
+                            f"sw_count={self._sw_count:.1f}/{self.switch_patience} keep_lock=({float(self._lock_xy[0]):.3f},{float(self._lock_xy[1]):.3f}) "
+                            f"cand_score={float(cand_score):.3f}"
+                        )
 
+                    if self._lost_count >= self.lost_patience:
+                        if dbg_on:
+                            print(f"[DET][LOCK_DROP_BY_SWITCH] step={self._step_i} lost={self._lost_count}/{self.lost_patience} confSA={c:.4f}")
+                        self._lock_xy = None
+                        self._lock_conf = 0.0
+                        self._lost_count = 0
+                        self._sw_xy = None
+                        self._sw_count = 0.0
+                        self._sw_best_score = None
+                        return x_n, y_n, c, logits
+
+                    return float(self._lock_xy[0]), float(self._lock_xy[1]), c, logits
+
+            # 기존 JUMP_REJECT (allow_thr 미만)
             self._lost_count += 1
             if dbg_on:
                 print(
@@ -496,22 +560,28 @@ class ReimuDetector:
 
             if self._lost_count >= self.lost_patience:
                 if dbg_on:
-                    print(
-                        f"[DET][LOCK_DROP_BY_JUMP] step={self._step_i} "
-                        f"lost={self._lost_count}/{self.lost_patience} confSA={c:.4f}"
-                    )
+                    print(f"[DET][LOCK_DROP_BY_JUMP] step={self._step_i} lost={self._lost_count}/{self.lost_patience} confSA={c:.4f}")
                 self._lock_xy = None
                 self._lock_conf = 0.0
                 self._lost_count = 0
+                self._sw_xy = None
+                self._sw_count = 0.0
+                self._sw_best_score = None
                 return x_n, y_n, c, logits
 
             return float(self._lock_xy[0]), float(self._lock_xy[1]), c, logits
 
-        # (B3) 정상 범위: lock을 부드럽게 업데이트
+        # 정상 범위: lock 부드럽게 업데이트
         a = 0.35
         self._lock_xy = (a * cur + (1.0 - a) * self._lock_xy).astype(np.float32)
         self._lock_conf = max(self._lock_conf * 0.90, c)
         self._lost_count = 0
+
+        # switch 후보는 서서히 잊기
+        self._sw_count *= self.switch_decay
+        if self._sw_count < 0.5:
+            self._sw_xy = None
+            self._sw_best_score = None
 
         self.last_lock_xy = (float(self._lock_xy[0]), float(self._lock_xy[1]))
 
@@ -522,15 +592,12 @@ class ReimuDetector:
             f"ema=({x_n:.3f},{y_n:.3f}) pick=({x_pick:.3f},{y_pick:.3f}) rawSA=({x_raw:.3f},{y_raw:.3f})"
         )
 
-        # ===== 프로파일(필요하면 프린트 켜서 확인) =====
         if self.print_prof:
             self._prof_step += 1
             if (self._prof_step % self.prof_every) == 0:
-                ms_pre = (t1 - t0) * 1000.0
-                ms_buf = (t2 - t1) * 1000.0
-                ms_in = (t3 - t2) * 1000.0
-                ms_fw = (t4 - t3) * 1000.0
                 ms_all = (t4 - t0) * 1000.0
-                # print(f"[DET_PROF] pre={ms_pre:.2f} buf={ms_buf:.2f} in={ms_in:.2f} fw={ms_fw:.2f} total={ms_all:.2f}")
+                # 필요하면 프린트 풀기
+                # print(f"[DET_PROF] total={ms_all:.2f}ms")
+                _ = ms_all
 
         return float(self._lock_xy[0]), float(self._lock_xy[1]), c, logits
