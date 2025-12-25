@@ -1,66 +1,74 @@
+# agents/ppo_agent.py
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.distributions import Categorical
 import os
 
-from models.shared.cnn_actor_critic import ActorCriticCNN
+from models.shared.two_stream_actor_critic import TwoStreamActorCriticCNN
 
 
 class PPOAgent:
+    """
+    ✅ 마스킹(exec_idx) 때문에 실제 실행 액션이 바뀌어도 PPO가 꼬이지 않게:
+      - rollout에 저장되는 (action, log_prob)는 '실행된 액션(exec_action)' 기준이어야 함
+      - store()에서 log_prob/value가 None이면, 현재 모델로 state를 다시 평가해서 저장
+        (rollout 중간에는 모델이 업데이트되지 않으니 on-policy로 취급 가능)
+
+    ✅ 또한 main_ppo.py가 예전 인자(two_stream 등)를 넘겨도 죽지 않게 **kwargs 흡수
+    """
+
     def __init__(
         self,
         input_channels,
         num_actions,
 
-        # 프레임당 obs 채널 수(= ObsBuilder.obs_channels)
-        obs_channels_per_frame=4,
+        # ✅ 2-stream: 프레임당 8채널(=ObsBuilder.obs_channels)
+        obs_channels_per_frame=8,
 
-        # ===== 학습률/할인 =====
-        lr=3.0e-4,          # (기존 2.5e-4) 적응 속도 약간↑
+        lr=3.0e-4,
         gamma=0.99,
         gae_lambda=0.95,
 
-        # ===== PPO 안정성(8방향 적응 빠르게) =====
-        clip_eps=0.15,      # (기존 0.2) 초기에 폭주 방지
+        clip_eps=0.15,
         vf_coef=0.5,
 
-        # ===== 탐색(Entropy): 짧게 강하게 → 빨리 감소 =====
-        ent_coef=0.04,      # (기존 0.03) 초반 탐색↑ (새 액션공간 적응)
-        ent_min=0.005,      # (기존 0.01) 최저 탐색은 더 낮게
-        ent_decay=0.9995,   # (기존 0.9999) 더 빨리 감소
+        ent_coef=0.04,
+        ent_min=0.005,
+        ent_decay=0.9995,
 
-        # ===== 업데이트 템포: 더 자주 업데이트 =====
-        rollout_steps=128,  # (기존 256) 적응 속도↑
-        update_epochs=5,    # (기존 4) 샘플 효율↑
+        rollout_steps=128,
+        update_epochs=5,
         mini_batch_size=64,
 
         device=None,
         max_grad_norm=0.5,
 
-        # ===== 엔트로피 warmup =====
-        ent_warmup_updates=30,  # (기존 50) 더 빨리 “정착” 모드로
-    ):
-        ...
+        ent_warmup_updates=30,
 
+        # ✅ 예전 코드 호환(넘어와도 무시)
+        **kwargs,
+    ):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.model = ActorCriticCNN(
+        self.model = TwoStreamActorCriticCNN(
             input_channels=int(input_channels),
             num_actions=int(num_actions),
             obs_channels_per_frame=int(obs_channels_per_frame),
+            global_channels=4,
+            local_channels=4,
             meta_patch=4,
-            meta_channel_offset=0,
+            meta_local_channel_offset=0,  # local ch0
         ).to(self.device)
 
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=float(lr))
 
-        self.gamma = gamma
-        self.gae_lambda = gae_lambda
-        self.clip_eps = clip_eps
-        self.vf_coef = vf_coef
+        # ✅ (중요) GAE에 쓰는 gamma 누락 수정
+        self.gamma = float(gamma)
+        self.gae_lambda = float(gae_lambda)
+        self.clip_eps = float(clip_eps)
+        self.vf_coef = float(vf_coef)
 
-        # entropy
         self.ent_coef = float(ent_coef)
         self.ent_min = float(ent_min)
         self.ent_decay = float(ent_decay)
@@ -71,8 +79,6 @@ class PPOAgent:
         self.max_grad_norm = float(max_grad_norm)
 
         self.global_step = 0
-
-        # ✅ 업데이트 카운터(엔트로피 warmup용)
         self.update_step = 0
         self.ent_warmup_updates = int(ent_warmup_updates)
 
@@ -86,18 +92,59 @@ class PPOAgent:
         self.log_probs = []
         self.values = []
 
-    def select_action(self, state):
-        s = torch.from_numpy(state[None].astype(np.float32)).to(self.device)
-        with torch.no_grad():
-            logits, value = self.model(s)
+    # -------------------------
+    # Policy helpers
+    # -------------------------
+    def _forward(self, state_np: np.ndarray):
+        s = torch.from_numpy(state_np[None].astype(np.float32)).to(self.device)
+        logits, value = self.model(s)  # logits: (1,A), value:(1,1)
+        return logits[0], value[0, 0]
+
+    @torch.no_grad()
+    def select_action(self, state: np.ndarray):
+        """
+        반환:
+          action_idx: policy가 샘플한 액션 (env에서 마스킹될 수 있음)
+          log_prob: 그 action_idx의 log_prob (참고용)
+          value: V(s)
+
+        ✅ 학습 rollout에는 '실행된 exec_action' 기준 log_prob가 들어가야 한다.
+          -> store()에서 exec_action에 대해 다시 계산한다.
+        """
+        logits, value = self._forward(state)
         dist = Categorical(logits=logits)
         action = dist.sample()
         log_prob = dist.log_prob(action)
         return int(action.item()), float(log_prob.item()), float(value.item())
 
-    def store(self, state, action, reward, done, log_prob, value):
+    @torch.no_grad()
+    def evaluate_action(self, state: np.ndarray, action_idx: int):
+        """
+        state에서 action_idx의 log_prob와 value를 계산 (exec_idx용)
+        """
+        logits, value = self._forward(state)
+        dist = Categorical(logits=logits)
+        a = torch.tensor(int(action_idx), device=logits.device, dtype=torch.long)
+        log_prob = dist.log_prob(a)
+        return float(log_prob.item()), float(value.item())
+
+    # -------------------------
+    # Rollout storage
+    # -------------------------
+    def store(self, state, action, reward, done, log_prob=None, value=None):
+        """
+        ✅ action은 '실행된 액션(exec_action_idx)'을 넣어야 한다.
+        - log_prob/value를 넘기지 않으면 여기서 exec_action 기준으로 재평가한다.
+        """
+        exec_action = int(action)
+
+        if (log_prob is None) or (value is None):
+            lp, v = self.evaluate_action(state, exec_action)
+            log_prob = lp
+            value = v
+
         self.states.append(state)
-        self.actions.append(action)
+        self.actions.append(exec_action)
         self.rewards.append(float(reward))
         self.dones.append(bool(done))
         self.log_probs.append(float(log_prob))
@@ -107,6 +154,9 @@ class PPOAgent:
     def should_update(self):
         return len(self.rewards) >= self.rollout_steps
 
+    # -------------------------
+    # GAE + PPO update
+    # -------------------------
     def _compute_gae(self, last_value: float = 0.0):
         advantages = []
         returns = []
@@ -121,12 +171,10 @@ class PPOAgent:
 
             advantages.insert(0, gae)
             returns.insert(0, gae + self.values[t])
-
             next_value = self.values[t]
 
         returns = np.asarray(returns, dtype=np.float32)
         advantages = np.asarray(advantages, dtype=np.float32)
-
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         return returns, advantages
 
@@ -153,10 +201,7 @@ class PPOAgent:
         n = states.size(0)
         idxs = np.arange(n)
 
-        total_loss = 0.0
-        total_policy_loss = 0.0
-        total_value_loss = 0.0
-        total_entropy = 0.0
+        total_loss = total_policy_loss = total_value_loss = total_entropy = 0.0
         steps = 0
 
         for _ in range(self.update_epochs):
@@ -216,6 +261,9 @@ class PPOAgent:
             "update_step": int(self.update_step),
         }
 
+    # -------------------------
+    # Save / Load
+    # -------------------------
     def save(self, path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save(
@@ -231,22 +279,210 @@ class PPOAgent:
 
     def load(self, path, load_optimizer=True):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-
         print("[LOAD] partial-load loader active")
 
         sd = ckpt.get("model", ckpt)
         cur = self.model.state_dict()
 
+        # -------------------------
+        # Helper: safe tensor copy
+        # -------------------------
+        def _copy_param(dst: torch.Tensor, src: torch.Tensor) -> bool:
+            if (dst is None) or (src is None):
+                return False
+            if dst.shape != src.shape:
+                return False
+            dst.copy_(src)
+            return True
+
+        def _copy_conv_in_channels(dst_w: torch.Tensor, src_w: torch.Tensor) -> bool:
+            """
+            conv weight: (out_ch, in_ch, kH, kW)
+            in_ch mismatch 시: 겹치는 채널만 복사하고 나머지는 0(또는 평균)로 채움.
+            """
+            if (dst_w.ndim != 4) or (src_w.ndim != 4):
+                return False
+            if (dst_w.shape[0] != src_w.shape[0]) or (dst_w.shape[2:] != src_w.shape[2:]):
+                return False
+
+            dst_w.zero_()
+            c = min(dst_w.shape[1], src_w.shape[1])
+            dst_w[:, :c].copy_(src_w[:, :c])
+
+            # dst의 in_ch가 더 큰 경우: 남는 채널은 src 평균으로 채우면 학습 초반 안정적
+            if dst_w.shape[1] > src_w.shape[1]:
+                mean = src_w.mean(dim=1, keepdim=True)  # (out,1,kH,kW)
+                dst_w[:, c:].copy_(mean.repeat(1, dst_w.shape[1] - c, 1, 1))
+            return True
+
+        def _copy_linear_partial(dst_w: torch.Tensor, dst_b: torch.Tensor,
+                                src_w: torch.Tensor, src_b: torch.Tensor,
+                                dst_offset: int):
+            """
+            dst_w: (out, dst_in)
+            src_w: (out, src_in)
+            dst_offset부터 src_in만큼 부분 복사.
+            out 차원도 겹치는 만큼만.
+            """
+            if dst_w.ndim != 2 or src_w.ndim != 2:
+                return 0
+            out = min(dst_w.shape[0], src_w.shape[0])
+            src_in = src_w.shape[1]
+            if dst_offset >= dst_w.shape[1]:
+                return 0
+            copy_in = min(src_in, dst_w.shape[1] - dst_offset)
+
+            # weight
+            dst_w[:out, dst_offset:dst_offset + copy_in].copy_(src_w[:out, :copy_in])
+
+            # bias (out 차원만 맞으면 복사)
+            if (dst_b is not None) and (src_b is not None) and (dst_b.ndim == 1) and (src_b.ndim == 1):
+                bb = min(dst_b.shape[0], src_b.shape[0])
+                dst_b[:bb].copy_(src_b[:bb])
+
+            return copy_in
+
+        # -------------------------
+        # 1) 먼저 "이식 가능한지" 체크
+        # -------------------------
+        has_old_single = any(k.startswith("conv.") for k in sd.keys()) and any(k.startswith("fc_img.") for k in sd.keys())
+        has_new_two = any(k.startswith("conv_g.") for k in cur.keys()) and any(k.startswith("conv_l.") for k in cur.keys())
+
+        transplanted = False
         filtered = {}
         skipped = []
+
+        # -------------------------
+        # 2) 기본 partial-load (이식 전에 일단 같은-shape 키는 로드 후보)
+        # -------------------------
         for k, v in sd.items():
             if (k in cur) and (cur[k].shape == v.shape):
                 filtered[k] = v
             else:
                 skipped.append(k)
 
+        # 우선 같은 키/shape는 로드
         msg = self.model.load_state_dict(filtered, strict=False)
 
+        # -------------------------
+        # 3) 단일 -> 2stream 이식
+        # -------------------------
+        if has_old_single and has_new_two:
+            try:
+                with torch.no_grad():
+                    # ---- conv trunk 복사 ----
+                    # old: conv.0/2/4.*  -> new: conv_g.0/2/4.*, conv_l.0/2/4.*
+                    for layer in [0, 2, 4]:
+                        ok_g = False
+                        ok_l = False
+
+                        old_w = sd.get(f"conv.{layer}.weight", None)
+                        old_b = sd.get(f"conv.{layer}.bias", None)
+
+                        new_g_w = cur.get(f"conv_g.{layer}.weight", None)
+                        new_g_b = cur.get(f"conv_g.{layer}.bias", None)
+                        new_l_w = cur.get(f"conv_l.{layer}.weight", None)
+                        new_l_b = cur.get(f"conv_l.{layer}.bias", None)
+
+                        if (old_w is not None) and (new_g_w is not None):
+                            ok_g = _copy_conv_in_channels(cur[f"conv_g.{layer}.weight"], old_w)
+                            if ok_g and (old_b is not None) and (new_g_b is not None) and (cur[f"conv_g.{layer}.bias"].shape == old_b.shape):
+                                cur[f"conv_g.{layer}.bias"].copy_(old_b)
+
+                        if (old_w is not None) and (new_l_w is not None):
+                            ok_l = _copy_conv_in_channels(cur[f"conv_l.{layer}.weight"], old_w)
+                            if ok_l and (old_b is not None) and (new_l_b is not None) and (cur[f"conv_l.{layer}.bias"].shape == old_b.shape):
+                                cur[f"conv_l.{layer}.bias"].copy_(old_b)
+
+                    # ---- fc_img 복사 ----
+                    # old: fc_img.0.* -> new: fc_g.0.*, fc_l.0.*
+                    old_fc_w = sd.get("fc_img.0.weight", None)
+                    old_fc_b = sd.get("fc_img.0.bias", None)
+
+                    if old_fc_w is not None and "fc_g.0.weight" in cur:
+                        if cur["fc_g.0.weight"].shape == old_fc_w.shape:
+                            cur["fc_g.0.weight"].copy_(old_fc_w)
+                            if old_fc_b is not None and cur["fc_g.0.bias"].shape == old_fc_b.shape:
+                                cur["fc_g.0.bias"].copy_(old_fc_b)
+
+                    if old_fc_w is not None and "fc_l.0.weight" in cur:
+                        if cur["fc_l.0.weight"].shape == old_fc_w.shape:
+                            cur["fc_l.0.weight"].copy_(old_fc_w)
+                            if old_fc_b is not None and cur["fc_l.0.bias"].shape == old_fc_b.shape:
+                                cur["fc_l.0.bias"].copy_(old_fc_b)
+
+                    # ---- meta 복사 ----
+                    # old: fc_meta.0.* -> new도 동일 키가 있다면 복사
+                    old_m_w = sd.get("fc_meta.0.weight", None)
+                    old_m_b = sd.get("fc_meta.0.bias", None)
+                    if old_m_w is not None and "fc_meta.0.weight" in cur:
+                        if cur["fc_meta.0.weight"].shape == old_m_w.shape:
+                            cur["fc_meta.0.weight"].copy_(old_m_w)
+                            if old_m_b is not None and cur["fc_meta.0.bias"].shape == old_m_b.shape:
+                                cur["fc_meta.0.bias"].copy_(old_m_b)
+
+                    # ---- policy/value head 부분 이식 ----
+                    # old head는 (A, 512+32)일 확률이 높고
+                    # new head는 (A, 512(g)+512(l)+32(meta)) 같은 구조일 확률이 큼.
+                    # => global(앞 512) + meta(맨끝 32)만 채우고 local(중간 512)은 0으로 둠.
+                    old_pi_w = sd.get("policy_head.weight", None)
+                    old_pi_b = sd.get("policy_head.bias", None)
+                    old_v_w = sd.get("value_head.weight", None)
+                    old_v_b = sd.get("value_head.bias", None)
+
+                    if (old_pi_w is not None) and ("policy_head.weight" in cur):
+                        dst_w = cur["policy_head.weight"]
+                        dst_b = cur.get("policy_head.bias", None)
+
+                        dst_w.zero_()
+                        if dst_b is not None:
+                            dst_b.zero_()
+
+                        # 1) global slice (offset 0)
+                        _copy_linear_partial(dst_w, dst_b, old_pi_w, old_pi_b, dst_offset=0)
+
+                        # 2) meta slice (끝 32칸이 meta라고 가정)
+                        meta_dim = 32
+                        if dst_w.shape[1] >= meta_dim and old_pi_w.shape[1] >= meta_dim:
+                            dst_meta_off = dst_w.shape[1] - meta_dim
+                            src_meta_off = old_pi_w.shape[1] - meta_dim
+                            # meta 부분만 따로 복사
+                            dst_w[:min(dst_w.shape[0], old_pi_w.shape[0]), dst_meta_off:dst_meta_off + meta_dim] = \
+                                old_pi_w[:min(dst_w.shape[0], old_pi_w.shape[0]), src_meta_off:src_meta_off + meta_dim]
+                            if (dst_b is not None) and (old_pi_b is not None):
+                                bb = min(dst_b.shape[0], old_pi_b.shape[0])
+                                dst_b[:bb] = old_pi_b[:bb]
+
+                    if (old_v_w is not None) and ("value_head.weight" in cur):
+                        dst_w = cur["value_head.weight"]
+                        dst_b = cur.get("value_head.bias", None)
+
+                        dst_w.zero_()
+                        if dst_b is not None:
+                            dst_b.zero_()
+
+                        _copy_linear_partial(dst_w, dst_b, old_v_w, old_v_b, dst_offset=0)
+
+                        meta_dim = 32
+                        if dst_w.shape[1] >= meta_dim and old_v_w.shape[1] >= meta_dim:
+                            dst_meta_off = dst_w.shape[1] - meta_dim
+                            src_meta_off = old_v_w.shape[1] - meta_dim
+                            dst_w[:min(dst_w.shape[0], old_v_w.shape[0]), dst_meta_off:dst_meta_off + meta_dim] = \
+                                old_v_w[:min(dst_w.shape[0], old_v_w.shape[0]), src_meta_off:src_meta_off + meta_dim]
+                            if (dst_b is not None) and (old_v_b is not None):
+                                bb = min(dst_b.shape[0], old_v_b.shape[0])
+                                dst_b[:bb] = old_v_b[:bb]
+
+                # 이식한 cur를 모델에 반영
+                self.model.load_state_dict(cur, strict=False)
+                transplanted = True
+            except Exception as e:
+                print(f"[LOAD][WARN] transplant failed (will keep partial-load only): {e}")
+                transplanted = False
+
+        # -------------------------
+        # 4) optimizer / counters
+        # -------------------------
         if load_optimizer:
             try:
                 if "optimizer" in ckpt:
@@ -259,12 +495,19 @@ class PPOAgent:
         if "ent_coef" in ckpt:
             self.ent_coef = float(ckpt["ent_coef"])
 
+        # -------------------------
+        # 5) print summary
+        # -------------------------
         try:
             print("[LOAD] loaded keys:", len(filtered))
-            print("[LOAD] missing keys:", msg.missing_keys)
+            print("[LOAD] missing keys(sample):", msg.missing_keys[:12], "..." if len(msg.missing_keys) > 12 else "")
             print("[LOAD] unexpected keys:", msg.unexpected_keys)
             if skipped:
                 print("[LOAD] skipped incompatible keys(sample):", skipped[:10], "...")
             print(f"[LOAD] global_step={self.global_step} update_step={self.update_step} ent_coef={self.ent_coef:.6f}")
+            if transplanted:
+                print("[LOAD][TRANSPLANT] single->two_stream weights transplanted (conv/fc/meta + partial heads).")
+            else:
+                print("[LOAD][TRANSPLANT] not applied.")
         except Exception:
             pass

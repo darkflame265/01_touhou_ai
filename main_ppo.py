@@ -6,6 +6,9 @@ import time
 from collections import Counter
 import re
 import tempfile
+import ctypes
+
+import numpy as np
 
 from env.game_env import GameEnv
 from env.controller import release_all, set_attack_hold
@@ -17,7 +20,6 @@ from env.menu import (
 from env.actions import ACTIONS
 from agents.ppo_agent import PPOAgent
 
-import ctypes
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 VK_ESCAPE = 0x1B
 
@@ -292,12 +294,45 @@ def _append_run_header(log_path: str, run_ts: str, episodes: int, is_eval: bool,
         f.write("idx\treward\tsurvival_sec\tnote\n")
 
 
+# =========================================================
+# ✅ 단일/2-stream state 유틸
+# =========================================================
+def _is_two_stream_state(state) -> bool:
+    if isinstance(state, dict):
+        return ("global" in state and "local" in state) or ("g" in state and "l" in state)
+    if isinstance(state, (tuple, list)) and len(state) == 2:
+        return True
+    return False
+
+
+def _get_streams(state):
+    """return (g, l) or (state, None)"""
+    if isinstance(state, dict):
+        if "global" in state and "local" in state:
+            return state["global"], state["local"]
+        if "g" in state and "l" in state:
+            return state["g"], state["l"]
+    if isinstance(state, (tuple, list)) and len(state) == 2:
+        return state[0], state[1]
+    return state, None
+
+
+def _state_shape_debug(state):
+    try:
+        if _is_two_stream_state(state):
+            g, l = _get_streams(state)
+            return f"two_stream | global={tuple(g.shape)} local={tuple(l.shape)} dtype={g.dtype}"
+        else:
+            return f"single | {tuple(state.shape)} dtype={state.dtype}"
+    except Exception:
+        return "state shape debug failed"
+
+
 def main():
     args = parse_args()
     is_eval = bool(args.eval)
 
     CKPT_PATH = "checkpoints/lunatic_v1_ch4.pth"
-
     os.makedirs(os.path.dirname(CKPT_PATH), exist_ok=True)
 
     pth_name = os.path.splitext(os.path.basename(CKPT_PATH))[0]
@@ -316,46 +351,15 @@ def main():
 
     boot_print_state(env)
 
-    obs_channels = int(getattr(env.obs, "obs_channels", 1))
-    stack_size = int(getattr(env.s, "frame_stack_size", 4))
-    input_channels = obs_channels * stack_size
-    print(f"[PPO] input_channels={input_channels} (obs_channels={obs_channels} * stack={stack_size})")
+    # ---------------------------------------------------------
+    # ✅ state를 한번 받아보고(초기 reset) 단일/2스트림 자동 판별
+    # ---------------------------------------------------------
+    # (주의) practice 진입 전에는 reset이 실패할 수 있으니,
+    # 아래에서 에피소드 루프 첫 reset 이후에 확정해도 됨.
+    # 여기선 "모델/agent 생성"을 위해 첫 에피소드에서 state로 결정.
+    # ---------------------------------------------------------
 
-    agent = PPOAgent(
-        input_channels=input_channels,
-        num_actions=len(ACTIONS),
-        obs_channels_per_frame=obs_channels,   # ✅ 이거 추가!
-    )
-
-    # ✅ eval이면 "로드만" 권장, 그래도 파일 있으면 로드하고 없으면 그냥 진행
-    if os.path.exists(CKPT_PATH):
-        agent.load(CKPT_PATH, load_optimizer=False)
-        print(f"[PPO] checkpoint loaded: {CKPT_PATH}")
-    else:
-        print("[PPO] no checkpoint found, training from scratch" if not is_eval else "[PPO][EVAL] no checkpoint found (evaluating random policy)")
-
-    # =========================================================
-    # ✅ 액션공간 전환기: ckpt 로드 후 하이퍼파라미터 강제 재설정
-    #    (8방향 고정 + 상시 slow 최적화)
-    # =========================================================
-    agent.ent_coef = 0.04
-    agent.ent_min = 0.005
-    agent.ent_decay = 0.9995
-    agent.ent_warmup_updates = 30
-
-    agent.clip_eps = 0.15
-    agent.rollout_steps = 128
-    agent.update_epochs = 5
-
-    print(
-        "[PPO][OVERRIDE] hyperparams overridden after ckpt load | "
-        f"ent_coef={agent.ent_coef:.3f}, "
-        f"ent_min={agent.ent_min:.3f}, "
-        f"clip_eps={agent.clip_eps:.2f}, "
-        f"rollout_steps={agent.rollout_steps}, "
-        f"update_epochs={agent.update_epochs}"
-    )
-
+    agent = None
 
     print("\n[INFO] ESC 중단: Windows 전역 감지(GetAsyncKeyState)")
     print(" - 게임 창이 포커스여도 ESC를 잡고 즉시 종료합니다.\n")
@@ -382,9 +386,71 @@ def main():
             safe_release_inputs()
             state = env.reset()
 
-            # 디버그(원하면 지워도 됨)
+            # ✅ 최초 1회: state 타입/채널로 agent 생성
+            if agent is None:
+                two_stream = _is_two_stream_state(state)
+                stack_size = int(getattr(env.s, "frame_stack_size", 4))
+
+                if two_stream:
+                    g, l = _get_streams(state)
+                    # g,l: (C,H,W) 라는 가정
+                    g_ch = int(g.shape[0])
+                    l_ch = int(l.shape[0])
+                    print(f"[PPO] detected TWO-STREAM state | g_ch={g_ch} l_ch={l_ch} stack={stack_size}")
+
+                    # PPOAgent가 two_stream 모델을 지원하도록 네가 이미 수정했다는 가정:
+                    #  - PPOAgent(..., two_stream=True, global_channels=g_ch, local_channels=l_ch)
+                    agent = PPOAgent(
+                        input_channels=(g_ch + l_ch),          # (참고용) 내부에서 안 쓰면 무시해도 됨
+                        num_actions=len(ACTIONS),
+                        obs_channels_per_frame=int(getattr(env.obs, "obs_channels", 4)),
+                        two_stream=True,
+                        global_channels=g_ch,
+                        local_channels=l_ch,
+                    )
+                else:
+                    obs_channels = int(getattr(env.obs, "obs_channels", 1))
+                    input_channels = obs_channels * stack_size
+                    print(f"[PPO] detected SINGLE state | input_channels={input_channels} (obs={obs_channels}*stack={stack_size})")
+
+                    agent = PPOAgent(
+                        input_channels=input_channels,
+                        num_actions=len(ACTIONS),
+                        obs_channels_per_frame=obs_channels,
+                        two_stream=False,
+                    )
+
+                # 체크포인트 로드
+                if os.path.exists(CKPT_PATH):
+                    agent.load(CKPT_PATH, load_optimizer=False)
+                    print(f"[PPO] checkpoint loaded: {CKPT_PATH}")
+                else:
+                    print("[PPO] no checkpoint found, training from scratch" if not is_eval else "[PPO][EVAL] no checkpoint found (evaluating random policy)")
+
+                # ✅ 액션공간 전환기: ckpt 로드 후 하이퍼파라미터 강제 재설정
+                agent.ent_coef = 0.04
+                agent.ent_min = 0.005
+                agent.ent_decay = 0.9995
+                agent.ent_warmup_updates = 30
+
+                agent.clip_eps = 0.15
+                agent.rollout_steps = 128
+                agent.update_epochs = 5
+
+                print(
+                    "[PPO][OVERRIDE] hyperparams overridden after ckpt load | "
+                    f"ent_coef={agent.ent_coef:.3f}, "
+                    f"ent_min={agent.ent_min:.3f}, "
+                    f"clip_eps={agent.clip_eps:.2f}, "
+                    f"rollout_steps={agent.rollout_steps}, "
+                    f"update_epochs={agent.update_epochs}"
+                )
+
+            # 디버그
             try:
-                print("[DBG] state.shape =", state.shape, "dtype=", state.dtype, "min/max=", float(state.min()), float(state.max()))
+                print("[DBG]", _state_shape_debug(state))
+                if not _is_two_stream_state(state):
+                    print("[DBG] min/max=", float(np.min(state)), float(np.max(state)))
             except Exception:
                 pass
 
@@ -418,13 +484,15 @@ def main():
                 # ✅ eval 모드면 학습 버퍼에 저장하지 않음
                 if not is_eval:
                     exec_idx = getattr(env.s, "exec_action_idx", action_idx)
+                    # ⚠️ 중요: 마스킹으로 exec_idx가 바뀌면 log_prob/value가 “샘플한 액션” 기준이라 PPO가 꼬일 수 있음.
+                    # 네가 PPOAgent에 "log_prob_of(state, action)" 같은 보조함수를 추가했다면,
+                    # 여기서 exec_idx 기준으로 재계산하는 게 베스트.
                     agent.store(state, exec_idx, reward, done, log_prob, value)
 
                 state = next_state
                 total_reward += reward
                 steps += 1
 
-                # ✅ eval 모드면 update 자체를 하지 않음
                 if (not is_eval) and agent.should_update():
                     agent.update(last_state=state, last_done=done)
 
@@ -445,7 +513,7 @@ def main():
                 f"top_actions={top_actions_str} {note}"
             )
 
-            # ✅ (중요) eval이어도 에피소드 결과 라인은 항상 로그에 남긴다
+            # ✅ eval이어도 에피소드 결과 라인은 항상 로그에 남긴다
             ep_tag = f"({ep}/{args.episodes})"
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"{ep_tag}\t{total_reward:.6f}\t{survival_sec:.3f}\t{note}\n")
@@ -470,7 +538,6 @@ def main():
                 else:
                     print("[WARN] checkpoint save failed -> continue training without stopping")
             else:
-                # eval은 stats 고정 출력(변화 없음)
                 print(_stats_one_line(stats))
 
             if stop_requested:

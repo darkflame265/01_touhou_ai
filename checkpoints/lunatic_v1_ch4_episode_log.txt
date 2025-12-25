@@ -837,3 +837,20 @@ idx	reward	survival_sec	note
 [STATS] total_completed=529 | best_reward=96.358 | best_survival=49.45s
 idx	reward	survival_sec	note
 (1/1)	22.233848	13.092	ABORTED
+
+========
+[RUN] 2025-12-25 13:54:08  episodes=1 eval=True
+[STATS] total_completed=529 | best_reward=96.358 | best_survival=49.45s
+idx	reward	survival_sec	note
+
+========
+[RUN] 2025-12-25 13:57:52  episodes=1 eval=True
+[STATS] total_completed=529 | best_reward=96.358 | best_survival=49.45s
+idx	reward	survival_sec	note
+(1/1)	24.291664	22.108	EVAL
+
+========
+[RUN] 2025-12-25 14:04:33  episodes=1 eval=True
+[STATS] total_completed=529 | best_reward=96.358 | best_survival=49.45s
+idx	reward	survival_sec	note
+(1/1)	27.300000	21.387	EVAL
