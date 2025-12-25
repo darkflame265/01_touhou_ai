@@ -1,6 +1,7 @@
 # env/obs_builder.py
 import cv2
 import numpy as np
+import time
 
 from env.reimu_detector import ReimuDetector
 
@@ -157,6 +158,32 @@ class ObsBuilder:
         self._l_bullet_cache_01 = None
         self._l_risk_cache_01 = None
 
+        self.obs_prof_enable = True
+        self.obs_prof_every = 200  # 몇 프레임마다 출력할지
+
+        self._prof_cnt = 0
+        self._prof_sum = {
+            "det": 0.0,            # detector step
+            "g_graydiff": 0.0,      # global gray + diff + resize(g0,g1)
+            "g_heavy": 0.0,         # global heavy (resize+HSV+DT+upsample)
+            "g_cache": 0.0,         # global cache reuse
+            "l_crop": 0.0,          # crop + valid mask prep
+            "l_graydiff": 0.0,      # local gray + diff + resize(l0,l1)
+            "l_heavy": 0.0,         # local heavy (resize+HSV+DT+center-weight)
+            "l_cache": 0.0,         # local cache reuse
+            "meta_stack": 0.0,      # meta inject + stack
+            "debug": 0.0,           # debug imshow
+            "total": 0.0,           # total make_state
+        }
+
+        # =========================
+        # ✅ (NEW) detector도 매 프레임 안 돌리기
+        # =========================
+        self.det_every = 4         # 2면 2프레임마다 1번만 det.step()
+        self._last_det = None      # (x_n, y_n, conf, logits) 캐시
+        self._last_det_reason = "INIT"
+
+
     # -------------------------
     # lifecycle
     # -------------------------
@@ -181,6 +208,16 @@ class ObsBuilder:
         self._g_risk_cache_01 = None
         self._l_bullet_cache_01 = None
         self._l_risk_cache_01 = None
+
+        # OBS PROF
+        self._prof_cnt = 0
+        for k in self._prof_sum:
+            self._prof_sum[k] = 0.0
+
+        self._last_det = None
+        self._last_det_reason = "RESET"
+
+
 
     def on_player_death(self):
         try:
@@ -415,12 +452,16 @@ class ObsBuilder:
     # main
     # -------------------------
     def make_state(self, img_bgr):
+        t_all0 = time.perf_counter()
+
         self._step_i += 1
         do_heavy = (self.enable_bullet_channels and (self.heavy_every <= 1 or (self._step_i % int(self.heavy_every) == 0)))
 
         # =========================================================
         # A) Global stream
         # =========================================================
+        t0 = time.perf_counter()
+
         play_gray = self.screen.get_playfield_gray(img_bgr)  # uint8
 
         if self._prev_play_gray_u8 is None or self._prev_play_gray_u8.shape != play_gray.shape:
@@ -429,35 +470,41 @@ class ObsBuilder:
             play_diff = cv2.absdiff(play_gray, self._prev_play_gray_u8)
         self._prev_play_gray_u8 = play_gray
 
-        # g0/g1은 항상 obs_out_size로
         interp_g = cv2.INTER_AREA if max(play_gray.shape[:2]) >= self.obs_out_size else cv2.INTER_LINEAR
         g0 = cv2.resize(play_gray, (self.obs_out_size, self.obs_out_size), interpolation=interp_g).astype(np.float32) / 255.0
         g1 = cv2.resize(play_diff, (self.obs_out_size, self.obs_out_size), interpolation=interp_g).astype(np.float32) / 255.0
 
+        t1 = time.perf_counter()
+        if self.obs_prof_enable:
+            self._prof_sum["g_graydiff"] += (t1 - t0)
+
         if do_heavy:
-            # playfield bgr
+            th0 = time.perf_counter()
+
             try:
                 play_bgr = self.screen.get_playfield_bgr(img_bgr)
             except Exception:
                 pw = int(self._playfield_w)
-                # copy() 꼭 필요 없음(읽기 전용) — OpenCV가 필요시 내부에서 처리함
-                play_bgr = img_bgr[:, :pw]
+                play_bgr = img_bgr[:, :pw].copy()
 
-            # ✅ 전역 bullet/risk는 저해상도에서만 계산
             gpw, gph = int(self.global_proc_size[0]), int(self.global_proc_size[1])
             play_bgr_small = cv2.resize(play_bgr, (gpw, gph), interpolation=cv2.INTER_AREA)
 
             g_bullet_u8_small = self._compute_bullet_mask_u8(play_bgr_small)
             g_risk_01_small = self._compute_risk_heat(g_bullet_u8_small, tau_px=float(self.risk_tau_px_global))
 
-            # 다시 obs_out_size로 올려서 입력 채널로 맞춤
             g2 = cv2.resize(g_bullet_u8_small, (self.obs_out_size, self.obs_out_size), interpolation=cv2.INTER_NEAREST).astype(np.float32) / 255.0
             g3 = cv2.resize(g_risk_01_small, (self.obs_out_size, self.obs_out_size), interpolation=cv2.INTER_LINEAR).astype(np.float32)
 
             self._g_bullet_cache_01 = g2
             self._g_risk_cache_01 = g3
+
+            th1 = time.perf_counter()
+            if self.obs_prof_enable:
+                self._prof_sum["g_heavy"] += (th1 - th0)
         else:
-            # 캐시 재사용
+            tc0 = time.perf_counter()
+
             if self._g_bullet_cache_01 is None:
                 self._g_bullet_cache_01 = np.zeros((self.obs_out_size, self.obs_out_size), dtype=np.float32)
             if self._g_risk_cache_01 is None:
@@ -465,28 +512,70 @@ class ObsBuilder:
             g2 = self._g_bullet_cache_01
             g3 = self._g_risk_cache_01
 
+            tc1 = time.perf_counter()
+            if self.obs_prof_enable:
+                self._prof_sum["g_cache"] += (tc1 - tc0)
+
         # =========================================================
         # B) Local stream
         # =========================================================
-        det = self.det.step(img_bgr)
+        td0 = time.perf_counter()
+
+
+        # B) Local stream - DET 캐시 (조건부 호출)
+        # =========================
+        # det_every를 4 정도로 올리고, 불안정할 때만 강제로 det
+        base_every = int(self.det_every)  # 예: 4
+        force = False
+
+        # 1) conf가 낮으면 강제 det
+        if float(self.last_conf) < (float(self.conf_update_thr) + 0.01):
+            force = True
+
+        # 2) 최근에 lost가 쌓였으면 강제 det
+        if int(self._lost_obs) >= 2:
+            force = True
+
+        # 3) 너무 오래 det 안 돌렸으면 강제 det
+        do_det = force or (base_every <= 1) or (self._step_i % base_every == 0)
+
+        if do_det:
+            det = self.det.step(img_bgr)
+            self._last_det = det
+            self._last_det_reason = "DET_STEP"
+        else:
+            det = self._last_det
+            self._last_det_reason = "DET_CACHE"
+
+
+
+        td1 = time.perf_counter()
+        if self.obs_prof_enable:
+            self._prof_sum["det"] += (td1 - td0)
 
         if det is None:
             cx, cy = self.player_center
         else:
-            x_n, y_n, conf, _logits = det
-            x_use, y_use, c_use, used, _reason = self._gate_xy_update(x_n, y_n, conf)
-
-            self.last_xy_norm = (float(x_use), float(y_use))
-            self.last_conf = float(c_use)
-
-            cx_new, cy_new = self._playfield_norm_to_full_xy(x_use, y_use)
-            if used:
-                cx, cy = cx_new, cy_new
-                self.player_center = (cx, cy)
-            else:
+            if not do_det:
+                # 캐시 프레임이면 좌표 업데이트 스킵(센터 유지)
                 cx, cy = self.player_center
+            else:
+                x_n, y_n, conf, _logits = det
+                x_use, y_use, c_use, used, _reason = self._gate_xy_update(x_n, y_n, conf)
 
-        # crop center smoothing
+                self.last_xy_norm = (float(x_use), float(y_use))
+                self.last_conf = float(c_use)
+
+                cx_new, cy_new = self._playfield_norm_to_full_xy(x_use, y_use)
+                if used:
+                    cx, cy = cx_new, cy_new
+                    self.player_center = (cx, cy)
+                else:
+                    cx, cy = self.player_center
+
+
+        tcrop0 = time.perf_counter()
+
         cx_i, cy_i = int(cx), int(cy)
         if self._crop_center_f is None:
             self._crop_center_f = (float(cx_i), float(cy_i))
@@ -508,20 +597,7 @@ class ObsBuilder:
 
         crop_bgr, valid_u8 = self._crop_square_bgr_with_mask(img_bgr, cx_s, cy_s, self.crop_size)
 
-        # crop_gray/diff는 기존대로(256에서 계산)
-        crop_gray_u8 = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-        if self._prev_crop_gray_u8 is None or self._prev_crop_gray_u8.shape != crop_gray_u8.shape:
-            diff_u8_full = np.zeros_like(crop_gray_u8)
-        else:
-            diff_u8_full = cv2.absdiff(crop_gray_u8, self._prev_crop_gray_u8)
-        self._prev_crop_gray_u8 = crop_gray_u8
-
-        # ✅ 로컬 입력 채널은 obs_out_size 기준으로 먼저 만들고
-        interp_l = cv2.INTER_AREA if self.crop_size >= self.obs_out_size else cv2.INTER_LINEAR
-        l0 = cv2.resize(crop_gray_u8, (self.obs_out_size, self.obs_out_size), interpolation=interp_l).astype(np.float32) / 255.0
-        l1 = cv2.resize(diff_u8_full, (self.obs_out_size, self.obs_out_size), interpolation=interp_l).astype(np.float32) / 255.0
-
-        # valid mask도 obs_out_size로 줄여서 적용
+        # valid mask를 128로 줄여서 준비
         if self.enable_valid_mask:
             valid01_full = (valid_u8.astype(np.float32) / 255.0)
             k = int(self.valid_mask_soft_blur)
@@ -532,8 +608,31 @@ class ObsBuilder:
         else:
             valid01 = None
 
+        tcrop1 = time.perf_counter()
+        if self.obs_prof_enable:
+            self._prof_sum["l_crop"] += (tcrop1 - tcrop0)
+
+        tld0 = time.perf_counter()
+
+        crop_gray_u8 = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+        if self._prev_crop_gray_u8 is None or self._prev_crop_gray_u8.shape != crop_gray_u8.shape:
+            diff_u8_full = np.zeros_like(crop_gray_u8)
+        else:
+            diff_u8_full = cv2.absdiff(crop_gray_u8, self._prev_crop_gray_u8)
+        self._prev_crop_gray_u8 = crop_gray_u8
+
+        interp_l = cv2.INTER_AREA if self.crop_size >= self.obs_out_size else cv2.INTER_LINEAR
+        l0 = cv2.resize(crop_gray_u8, (self.obs_out_size, self.obs_out_size), interpolation=interp_l).astype(np.float32) / 255.0
+        l1 = cv2.resize(diff_u8_full, (self.obs_out_size, self.obs_out_size), interpolation=interp_l).astype(np.float32) / 255.0
+
+        tld1 = time.perf_counter()
+        if self.obs_prof_enable:
+            self._prof_sum["l_graydiff"] += (tld1 - tld0)
+
         if do_heavy:
-            # ✅ heavy(HSV/DT)는 obs_out_size에서만 수행
+            tlh0 = time.perf_counter()
+
+            # 128 기준 bgr 만들기(HSV/DT 여기서만)
             l_bgr_small = cv2.resize(crop_bgr, (self.obs_out_size, self.obs_out_size), interpolation=cv2.INTER_AREA)
             l_bullet_u8_small = self._compute_bullet_mask_u8(l_bgr_small)
             l_risk_base = self._compute_risk_heat(l_bullet_u8_small, tau_px=float(self.risk_tau_px_local))
@@ -565,7 +664,13 @@ class ObsBuilder:
 
             self._l_bullet_cache_01 = l2
             self._l_risk_cache_01 = l3
+
+            tlh1 = time.perf_counter()
+            if self.obs_prof_enable:
+                self._prof_sum["l_heavy"] += (tlh1 - tlh0)
         else:
+            tlc0 = time.perf_counter()
+
             if self._l_bullet_cache_01 is None:
                 self._l_bullet_cache_01 = np.zeros((self.obs_out_size, self.obs_out_size), dtype=np.float32)
             if self._l_risk_cache_01 is None:
@@ -573,19 +678,26 @@ class ObsBuilder:
             l2 = self._l_bullet_cache_01
             l3 = self._l_risk_cache_01
 
+            tlc1 = time.perf_counter()
+            if self.obs_prof_enable:
+                self._prof_sum["l_cache"] += (tlc1 - tlc0)
+
         # valid mask 적용(128 기준)
         if valid01 is not None:
-            l0 = (l0 * valid01).astype(np.float32, copy=False)
-            l1 = (l1 * valid01).astype(np.float32, copy=False)
-            l2 = (l2 * valid01).astype(np.float32, copy=False)
-            l3 = (l3 * valid01).astype(np.float32, copy=False)
+            l0 = (l0 * valid01).astype(np.float32)
+            l1 = (l1 * valid01).astype(np.float32)
+            l2 = (l2 * valid01).astype(np.float32)
+            l3 = (l3 * valid01).astype(np.float32)
 
-        # meta -> local ch0 only
+        tms0 = time.perf_counter()
         l0 = self._inject_meta_pixels_local_ch0(l0)
-
         obs8 = np.stack([g0, g1, g2, g3, l0, l1, l2, l3], axis=0).astype(np.float32, copy=False)
+        tms1 = time.perf_counter()
+        if self.obs_prof_enable:
+            self._prof_sum["meta_stack"] += (tms1 - tms0)
 
-        # debug show (업샘플해서 보기 좋게)
+        # debug show (업샘플)
+        tdbg0 = time.perf_counter()
         if self.show_obs_debug:
             try:
                 self._ensure_obs_window()
@@ -603,5 +715,35 @@ class ObsBuilder:
                 cv2.waitKey(1)
             except Exception:
                 pass
+        tdbg1 = time.perf_counter()
+        if self.obs_prof_enable:
+            self._prof_sum["debug"] += (tdbg1 - tdbg0)
+
+        # =========================
+        # PROF PRINT
+        # =========================
+        t_all1 = time.perf_counter()
+        if self.obs_prof_enable:
+            self._prof_sum["total"] += (t_all1 - t_all0)
+            self._prof_cnt += 1
+            if (self._prof_cnt % int(self.obs_prof_every)) == 0:
+                n = max(1, int(self._prof_cnt))
+                # 최근 구간 평균만 보고 싶으면, 출력 후 sum을 0으로 리셋하는 방식으로 바꿔도 됨.
+                def ms(key): 
+                    return (self._prof_sum[key] / float(self.obs_prof_every)) * 1000.0
+
+                print(
+                    "[OBS_PROF] avg_ms/call | "
+                    f"total={ms('total'):.2f} "
+                    f"det={ms('det'):.2f} "
+                    f"g(gray+diff)={ms('g_graydiff'):.2f} g(heavy)={ms('g_heavy'):.2f} g(cache)={ms('g_cache'):.2f} | "
+                    f"l(crop)={ms('l_crop'):.2f} l(gray+diff)={ms('l_graydiff'):.2f} l(heavy)={ms('l_heavy'):.2f} l(cache)={ms('l_cache'):.2f} | "
+                    f"meta+stack={ms('meta_stack'):.2f} dbg={ms('debug'):.2f} "
+                    f"(heavy_every={self.heavy_every}, do_heavy={do_heavy})"
+                )
+
+                # ✅ “최근 obs_prof_every 구간”만 보려고 평균 안정화시키고 싶으면 아래 리셋 추천
+                for k in self._prof_sum:
+                    self._prof_sum[k] = 0.0
 
         return obs8

@@ -23,7 +23,7 @@ class EnvState:
     step_i: int = 0
 
     action_repeat: int = 2
-    frame_sleep: float = 0.03
+    frame_sleep: float = 0.018
 
     ui_absent_count: int = 0
     ui_absent_needed: int = 2
