@@ -12,15 +12,23 @@ class ObsBuilder:
         g0: playfield_gray (0..1)
         g1: absdiff(playfield_gray, prev_playfield_gray) (0..1)
         g2: bullet_candidate_mask_global (0..1)
-        g3: risk_heatmap_global (0..1)  [distanceTransform 기반]
+        g3: risk_heatmap_global (0..1)
 
       - Local(레이무 주변 crop)
         l0: crop_gray (0..1) + meta pixels(x,y,conf)
         l1: absdiff(crop_gray, prev_crop_gray) (0..1)
         l2: bullet_candidate_mask_local (0..1)
-        l3: risk_heatmap_centered_local (0..1) [distanceTransform + 중심가중치]
+        l3: risk_heatmap_centered_local (0..1)
 
     ✅ 리턴 shape: (8, obs_out_size, obs_out_size) float32
+
+    =========================
+    (OPT) 즉시 체감 최적화
+      - heavy(HSV/DT)는 heavy_every 프레임마다만 갱신, 나머지는 캐시 재사용
+      - Global bullet/risk: 저해상도(global_proc_size)에서만 계산
+      - Local bullet/risk : crop_size(256)에서 하지 않고 obs_out_size(128)에서만 계산
+      - 디버그는 업샘플해서 보기 좋게만 표시(학습 입력에는 영향 없음)
+    =========================
     """
 
     def __init__(self, screen, debug_viz=None, obs_out_size=128, crop_size=256, use_fallback_full_preprocess=True):
@@ -31,7 +39,6 @@ class ObsBuilder:
         self.crop_size = int(crop_size)
         self.use_fallback_full_preprocess = bool(use_fallback_full_preprocess)
 
-        # ✅ 프레임당 채널: Global 4 + Local 4 = 8
         self.global_channels = 4
         self.local_channels = 4
         self.obs_channels = self.global_channels + self.local_channels  # 8
@@ -45,7 +52,7 @@ class ObsBuilder:
         self._playfield_w = max(1, min(self.W, int(self.W * self._playfield_ratio)))
 
         # -------------------------
-        # Detector (기존 유지)
+        # Detector
         # -------------------------
         self.det = ReimuDetector(
             screen=self.screen,
@@ -68,7 +75,6 @@ class ObsBuilder:
             prof_every=200,
         )
 
-        # 기본 초기 위치/신뢰도
         self.player_center = (w0 // 2, int(h0 * 0.78))
         self.conf_update_thr = 0.02
 
@@ -83,7 +89,6 @@ class ObsBuilder:
         self.edge_jump_conf_gain = 3.0
         self.edge_jump_min_conf = 0.90
 
-        # 정책/리워드용 좌표/신뢰도
         self.last_xy_norm = (0.5, 0.78)
         self.last_conf = 0.0
 
@@ -108,19 +113,16 @@ class ObsBuilder:
         self._prev_play_gray_u8 = None
 
         # -------------------------
-        # Bullet / Risk params (공용)
+        # Bullet / Risk params
         # -------------------------
         self.enable_bullet_channels = True
-
         self.bullet_hsv_s_min = 40
         self.bullet_hsv_v_min = 140
         self.bullet_hsv_v_max = 255
         self.bullet_close_morph = 0
 
-        # risk (local/global 각각 사용)
         self.risk_tau_px_local = 8.0
         self.risk_tau_px_global = 10.0
-
         self.center_sigma_px = float(self.crop_size) * 0.35
         self.risk_clip_max = 1.0
 
@@ -133,9 +135,6 @@ class ObsBuilder:
         self.risk_decay = 0.70
         self._risk_hold_crop_01 = None
 
-        # post blur
-        self.post_resize_blur_ksize = 0
-
         # crop 바깥 clamp(거울 패딩 원천 차단)
         self.clamp_crop_inside = True
 
@@ -143,8 +142,20 @@ class ObsBuilder:
         self.enable_valid_mask = True
         self.valid_mask_soft_blur = 7
 
-        # global에도 “패딩” 같은 건 없지만, playfield 절단/리사이즈에서 과신호 줄이려면 쓸 수 있음(기본 off)
-        self.global_apply_soft_mask = False
+        # =========================
+        # ✅ (NEW) 최적화 스위치
+        # =========================
+        self.heavy_every = 2               # HSV/DT 같은 무거운 채널 갱신 주기
+        self._step_i = 0
+
+        # 전역 bullet/risk 계산 해상도 (작을수록 빠름)
+        self.global_proc_size = (96, 72)   # (W,H) 추천: (96,72) / (128,96)
+
+        # 캐시(heavy_every 사이 프레임에서 재사용) — 모두 "obs_out_size" 기준 float32(0..1)
+        self._g_bullet_cache_01 = None
+        self._g_risk_cache_01 = None
+        self._l_bullet_cache_01 = None
+        self._l_risk_cache_01 = None
 
     # -------------------------
     # lifecycle
@@ -164,6 +175,12 @@ class ObsBuilder:
 
         self._crop_center_f = None
         self._risk_hold_crop_01 = None
+
+        self._step_i = 0
+        self._g_bullet_cache_01 = None
+        self._g_risk_cache_01 = None
+        self._l_bullet_cache_01 = None
+        self._l_risk_cache_01 = None
 
     def on_player_death(self):
         try:
@@ -216,7 +233,6 @@ class ObsBuilder:
         y_n = float(np.clip(y_n, 0.0, 1.0))
         conf = float(conf)
 
-        # 1) 너무 낮은 conf는 홀드
         if conf < float(self.conf_update_thr):
             self._lost_obs += 1
             if self._lost_obs >= int(self.lost_patience_obs):
@@ -226,7 +242,6 @@ class ObsBuilder:
 
         d = self._dist_norm((x_n, y_n), prev_xy)
 
-        # 2) 점프면 accept/reject
         if d > float(self.max_jump_norm_obs):
             need = max(1e-6, prev_c) * float(self.jump_allow_conf_gain_obs)
 
@@ -257,9 +272,6 @@ class ObsBuilder:
         return (x_n, y_n, conf, True, "OK")
 
     def _inject_meta_pixels_local_ch0(self, local_ch0_01: np.ndarray) -> np.ndarray:
-        """
-        local ch0에만 meta 삽입(기존 전략 유지)
-        """
         try:
             x_n, y_n = self.last_xy_norm
             c = float(self.last_conf)
@@ -289,9 +301,6 @@ class ObsBuilder:
         return int(np.clip(cx, cx_min, cx_max)), int(np.clip(cy, cy_min, cy_max))
 
     def _crop_square_bgr_with_mask(self, img_bgr, cx, cy, size):
-        """
-        crop + valid_mask_u8(원본=255, padding=0)
-        """
         h, w = img_bgr.shape[:2]
         size = int(size)
         half = size // 2
@@ -351,7 +360,6 @@ class ObsBuilder:
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
         s = hsv[:, :, 1]
         v = hsv[:, :, 2]
-
         mask = (s >= int(self.bullet_hsv_s_min)) & (v >= int(self.bullet_hsv_v_min)) & (v <= int(self.bullet_hsv_v_max))
         mask_u8 = (mask.astype(np.uint8) * 255)
 
@@ -377,11 +385,8 @@ class ObsBuilder:
             risk = np.clip(risk, 0.0, float(self.risk_clip_max))
         return risk.astype(np.float32, copy=False)
 
-    def _compute_risk_heat_centered_local(self, bullet_mask_u8: np.ndarray, center_xy=None) -> np.ndarray:
-        # base risk
-        risk = self._compute_risk_heat(bullet_mask_u8, tau_px=float(self.risk_tau_px_local))
-
-        h, w = risk.shape[:2]
+    def _compute_risk_heat_centered_local(self, risk01: np.ndarray, center_xy=None) -> np.ndarray:
+        h, w = risk01.shape[:2]
         if center_xy is None:
             cx = (w - 1) * 0.5
             cy = (h - 1) * 0.5
@@ -394,10 +399,11 @@ class ObsBuilder:
 
         yy, xx = np.indices((h, w), dtype=np.float32)
         rr2 = (xx - cx) ** 2 + (yy - cy) ** 2
-        sigma = max(1e-6, float(self.center_sigma_px))
+        # 256기준 sigma를 128좌표계로 스케일
+        sigma = max(1e-6, float(self.center_sigma_px) * (float(w) / float(self.crop_size)))
         center_w = np.exp(-rr2 / (2.0 * sigma * sigma)).astype(np.float32)
 
-        risk_centered = risk * center_w
+        risk_centered = risk01 * center_w
         m = float(risk_centered.max())
         if m > 1e-6:
             risk_centered = risk_centered / m
@@ -409,53 +415,66 @@ class ObsBuilder:
     # main
     # -------------------------
     def make_state(self, img_bgr):
-        # =========================================================
-        # A) Global stream (전체 플레이필드)
-        # =========================================================
-        # playfield는 screen.get_playfield_gray/img에서 쓰던 그 영역이 가장 안정적
-        play_gray = self.screen.get_playfield_gray(img_bgr)  # (Hpf, Wpf) uint8
+        self._step_i += 1
+        do_heavy = (self.enable_bullet_channels and (self.heavy_every <= 1 or (self._step_i % int(self.heavy_every) == 0)))
 
-        # global diff
+        # =========================================================
+        # A) Global stream
+        # =========================================================
+        play_gray = self.screen.get_playfield_gray(img_bgr)  # uint8
+
         if self._prev_play_gray_u8 is None or self._prev_play_gray_u8.shape != play_gray.shape:
             play_diff = np.zeros_like(play_gray)
         else:
             play_diff = cv2.absdiff(play_gray, self._prev_play_gray_u8)
         self._prev_play_gray_u8 = play_gray
 
-        # global bullet/risk
-        if self.enable_bullet_channels:
-            # playfield bgr이 없다면, 전체 img에서 playfield 영역만 잘라서 사용
-            # Screen에 get_playfield_bgr가 없을 수도 있어서 안전하게 slice를 구성
-            try:
-                play_bgr = self.screen.get_playfield_bgr(img_bgr)  # 있으면 최고
-            except Exception:
-                # fallback: 화면 좌측 playfield 정도만 추정 (ratio 기반)
-                pw = int(self._playfield_w)
-                play_bgr = img_bgr[:, :pw].copy()
-
-            g_bullet_u8 = self._compute_bullet_mask_u8(play_bgr)
-            g_risk_01 = self._compute_risk_heat(g_bullet_u8, tau_px=float(self.risk_tau_px_global))
-        else:
-            g_bullet_u8 = np.zeros_like(play_gray, dtype=np.uint8)
-            g_risk_01 = np.zeros_like(play_gray, dtype=np.float32)
-
-        # resize to obs_out_size
+        # g0/g1은 항상 obs_out_size로
         interp_g = cv2.INTER_AREA if max(play_gray.shape[:2]) >= self.obs_out_size else cv2.INTER_LINEAR
         g0 = cv2.resize(play_gray, (self.obs_out_size, self.obs_out_size), interpolation=interp_g).astype(np.float32) / 255.0
         g1 = cv2.resize(play_diff, (self.obs_out_size, self.obs_out_size), interpolation=interp_g).astype(np.float32) / 255.0
-        g2 = cv2.resize(g_bullet_u8, (self.obs_out_size, self.obs_out_size), interpolation=interp_g).astype(np.float32) / 255.0
-        g3 = cv2.resize(g_risk_01, (self.obs_out_size, self.obs_out_size), interpolation=interp_g).astype(np.float32)
+
+        if do_heavy:
+            # playfield bgr
+            try:
+                play_bgr = self.screen.get_playfield_bgr(img_bgr)
+            except Exception:
+                pw = int(self._playfield_w)
+                # copy() 꼭 필요 없음(읽기 전용) — OpenCV가 필요시 내부에서 처리함
+                play_bgr = img_bgr[:, :pw]
+
+            # ✅ 전역 bullet/risk는 저해상도에서만 계산
+            gpw, gph = int(self.global_proc_size[0]), int(self.global_proc_size[1])
+            play_bgr_small = cv2.resize(play_bgr, (gpw, gph), interpolation=cv2.INTER_AREA)
+
+            g_bullet_u8_small = self._compute_bullet_mask_u8(play_bgr_small)
+            g_risk_01_small = self._compute_risk_heat(g_bullet_u8_small, tau_px=float(self.risk_tau_px_global))
+
+            # 다시 obs_out_size로 올려서 입력 채널로 맞춤
+            g2 = cv2.resize(g_bullet_u8_small, (self.obs_out_size, self.obs_out_size), interpolation=cv2.INTER_NEAREST).astype(np.float32) / 255.0
+            g3 = cv2.resize(g_risk_01_small, (self.obs_out_size, self.obs_out_size), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+
+            self._g_bullet_cache_01 = g2
+            self._g_risk_cache_01 = g3
+        else:
+            # 캐시 재사용
+            if self._g_bullet_cache_01 is None:
+                self._g_bullet_cache_01 = np.zeros((self.obs_out_size, self.obs_out_size), dtype=np.float32)
+            if self._g_risk_cache_01 is None:
+                self._g_risk_cache_01 = np.zeros((self.obs_out_size, self.obs_out_size), dtype=np.float32)
+            g2 = self._g_bullet_cache_01
+            g3 = self._g_risk_cache_01
 
         # =========================================================
-        # B) Local stream (레이무 주변)
+        # B) Local stream
         # =========================================================
         det = self.det.step(img_bgr)
 
         if det is None:
             cx, cy = self.player_center
         else:
-            x_n, y_n, conf, logits = det
-            x_use, y_use, c_use, used, reason = self._gate_xy_update(x_n, y_n, conf)
+            x_n, y_n, conf, _logits = det
+            x_use, y_use, c_use, used, _reason = self._gate_xy_update(x_n, y_n, conf)
 
             self.last_xy_norm = (float(x_use), float(y_use))
             self.last_conf = float(c_use)
@@ -489,91 +508,95 @@ class ObsBuilder:
 
         crop_bgr, valid_u8 = self._crop_square_bgr_with_mask(img_bgr, cx_s, cy_s, self.crop_size)
 
-        # valid mask
+        # crop_gray/diff는 기존대로(256에서 계산)
+        crop_gray_u8 = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+        if self._prev_crop_gray_u8 is None or self._prev_crop_gray_u8.shape != crop_gray_u8.shape:
+            diff_u8_full = np.zeros_like(crop_gray_u8)
+        else:
+            diff_u8_full = cv2.absdiff(crop_gray_u8, self._prev_crop_gray_u8)
+        self._prev_crop_gray_u8 = crop_gray_u8
+
+        # ✅ 로컬 입력 채널은 obs_out_size 기준으로 먼저 만들고
+        interp_l = cv2.INTER_AREA if self.crop_size >= self.obs_out_size else cv2.INTER_LINEAR
+        l0 = cv2.resize(crop_gray_u8, (self.obs_out_size, self.obs_out_size), interpolation=interp_l).astype(np.float32) / 255.0
+        l1 = cv2.resize(diff_u8_full, (self.obs_out_size, self.obs_out_size), interpolation=interp_l).astype(np.float32) / 255.0
+
+        # valid mask도 obs_out_size로 줄여서 적용
         if self.enable_valid_mask:
-            valid01 = (valid_u8.astype(np.float32) / 255.0)
+            valid01_full = (valid_u8.astype(np.float32) / 255.0)
             k = int(self.valid_mask_soft_blur)
             if k and k >= 3 and (k % 2 == 1):
-                valid01 = cv2.GaussianBlur(valid01, (k, k), 0)
-            valid01 = np.clip(valid01, 0.0, 1.0).astype(np.float32, copy=False)
+                valid01_full = cv2.GaussianBlur(valid01_full, (k, k), 0)
+            valid01_full = np.clip(valid01_full, 0.0, 1.0).astype(np.float32, copy=False)
+            valid01 = cv2.resize(valid01_full, (self.obs_out_size, self.obs_out_size), interpolation=cv2.INTER_LINEAR).astype(np.float32)
         else:
             valid01 = None
 
-        crop_gray_u8 = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-        if self._prev_crop_gray_u8 is None or self._prev_crop_gray_u8.shape != crop_gray_u8.shape:
-            diff_u8 = np.zeros_like(crop_gray_u8)
-        else:
-            diff_u8 = cv2.absdiff(crop_gray_u8, self._prev_crop_gray_u8)
-        self._prev_crop_gray_u8 = crop_gray_u8
+        if do_heavy:
+            # ✅ heavy(HSV/DT)는 obs_out_size에서만 수행
+            l_bgr_small = cv2.resize(crop_bgr, (self.obs_out_size, self.obs_out_size), interpolation=cv2.INTER_AREA)
+            l_bullet_u8_small = self._compute_bullet_mask_u8(l_bgr_small)
+            l_risk_base = self._compute_risk_heat(l_bullet_u8_small, tau_px=float(self.risk_tau_px_local))
 
-        if self.enable_bullet_channels:
-            l_bullet_u8 = self._compute_bullet_mask_u8(crop_bgr)
-
+            # 중심가중치(128 좌표계)
             try:
-                half = 0.5 * float(self.crop_size)
+                half = 0.5 * float(self.obs_out_size)
                 if det is None:
                     center_xy = (half, half)
                 else:
                     cx_target, cy_target = self._playfield_norm_to_full_xy(self.last_xy_norm[0], self.last_xy_norm[1])
-                    dx = float(cx_target - cx_s)
-                    dy = float(cy_target - cy_s)
+                    dx = float(cx_target - cx_s) * (float(self.obs_out_size) / float(self.crop_size))
+                    dy = float(cy_target - cy_s) * (float(self.obs_out_size) / float(self.crop_size))
                     center_xy = (half + dx, half + dy)
             except Exception:
                 center_xy = None
 
-            l_risk_now = self._compute_risk_heat_centered_local(l_bullet_u8, center_xy=center_xy)
+            l_risk_now = self._compute_risk_heat_centered_local(l_risk_base, center_xy=center_xy)
 
+            # max-hold + decay
             if self._risk_hold_crop_01 is None or self._risk_hold_crop_01.shape != l_risk_now.shape:
                 self._risk_hold_crop_01 = l_risk_now.astype(np.float32, copy=True)
             else:
                 decay = float(np.clip(self.risk_decay, 0.0, 1.0))
                 self._risk_hold_crop_01 = np.maximum(self._risk_hold_crop_01 * decay, l_risk_now).astype(np.float32, copy=False)
 
-            l_risk_01 = self._risk_hold_crop_01
+            l2 = (l_bullet_u8_small.astype(np.float32) / 255.0)
+            l3 = self._risk_hold_crop_01.astype(np.float32, copy=False)
+
+            self._l_bullet_cache_01 = l2
+            self._l_risk_cache_01 = l3
         else:
-            l_bullet_u8 = np.zeros((self.crop_size, self.crop_size), dtype=np.uint8)
-            l_risk_01 = np.zeros((self.crop_size, self.crop_size), dtype=np.float32)
+            if self._l_bullet_cache_01 is None:
+                self._l_bullet_cache_01 = np.zeros((self.obs_out_size, self.obs_out_size), dtype=np.float32)
+            if self._l_risk_cache_01 is None:
+                self._l_risk_cache_01 = np.zeros((self.obs_out_size, self.obs_out_size), dtype=np.float32)
+            l2 = self._l_bullet_cache_01
+            l3 = self._l_risk_cache_01
 
-        # apply valid mask
+        # valid mask 적용(128 기준)
         if valid01 is not None:
-            crop_gray_u8 = np.clip(crop_gray_u8.astype(np.float32) * valid01, 0, 255).astype(np.uint8)
-            diff_u8 = np.clip(diff_u8.astype(np.float32) * valid01, 0, 255).astype(np.uint8)
-            l_bullet_u8 = np.clip(l_bullet_u8.astype(np.float32) * valid01, 0, 255).astype(np.uint8)
-            l_risk_01 = (l_risk_01.astype(np.float32) * valid01).astype(np.float32)
-
-        # resize local to obs_out_size
-        interp_l = cv2.INTER_AREA if self.crop_size >= self.obs_out_size else cv2.INTER_LINEAR
-        l0 = cv2.resize(crop_gray_u8, (self.obs_out_size, self.obs_out_size), interpolation=interp_l).astype(np.float32) / 255.0
-        l1 = cv2.resize(diff_u8, (self.obs_out_size, self.obs_out_size), interpolation=interp_l).astype(np.float32) / 255.0
-        l2 = cv2.resize(l_bullet_u8, (self.obs_out_size, self.obs_out_size), interpolation=interp_l).astype(np.float32) / 255.0
-        l3 = cv2.resize(l_risk_01, (self.obs_out_size, self.obs_out_size), interpolation=interp_l).astype(np.float32)
-
-        # post blur (optional)
-        k = int(self.post_resize_blur_ksize)
-        if k and k >= 3 and (k % 2 == 1):
-            g0 = cv2.GaussianBlur(g0, (k, k), 0)
-            g1 = cv2.GaussianBlur(g1, (k, k), 0)
-            g2 = cv2.GaussianBlur(g2, (k, k), 0)
-            g3 = cv2.GaussianBlur(g3, (k, k), 0)
-            l0 = cv2.GaussianBlur(l0, (k, k), 0)
-            l1 = cv2.GaussianBlur(l1, (k, k), 0)
-            l2 = cv2.GaussianBlur(l2, (k, k), 0)
-            l3 = cv2.GaussianBlur(l3, (k, k), 0)
+            l0 = (l0 * valid01).astype(np.float32, copy=False)
+            l1 = (l1 * valid01).astype(np.float32, copy=False)
+            l2 = (l2 * valid01).astype(np.float32, copy=False)
+            l3 = (l3 * valid01).astype(np.float32, copy=False)
 
         # meta -> local ch0 only
         l0 = self._inject_meta_pixels_local_ch0(l0)
 
         obs8 = np.stack([g0, g1, g2, g3, l0, l1, l2, l3], axis=0).astype(np.float32, copy=False)
 
-        # debug show: risk maps
+        # debug show (업샘플해서 보기 좋게)
         if self.show_obs_debug:
             try:
                 self._ensure_obs_window()
+
                 visL = (np.clip(l3, 0.0, 1.0) * 255.0).astype(np.uint8)
+                visL = cv2.resize(visL, self._obs_win_size, interpolation=cv2.INTER_NEAREST)
                 visL = cv2.cvtColor(visL, cv2.COLOR_GRAY2BGR)
                 cv2.imshow(self.win_local_risk, visL)
 
                 visG = (np.clip(g3, 0.0, 1.0) * 255.0).astype(np.uint8)
+                visG = cv2.resize(visG, self._obs_win_size, interpolation=cv2.INTER_NEAREST)
                 visG = cv2.cvtColor(visG, cv2.COLOR_GRAY2BGR)
                 cv2.imshow(self.win_global_risk, visG)
 
