@@ -22,4 +22,6 @@ pytorch를 이용해서 동방 게임(홍마향)을 AI가 자동으로 플레이
 
 
 <img width="639" height="504" alt="스크린샷 2025-12-15 194333" src="https://github.com/user-attachments/assets/d9c8766c-71e9-4e81-9bed-83b632aa3a5e" />
->>>>>>> 3052d9bbf8de3e57f0345ac38f895224f9e04a30
+
+<img width="634" height="507" alt="스크린샷 2026-01-05 124444" src="https://github.com/user-attachments/assets/60490f1e-6c81-4773-a674-b8bad4e22b0c" />
+
